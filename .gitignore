@@ -1,0 +1,13 @@
+# User artwork and generated machine-specific actions
+*.psd
+*.psb
+*.bmp
+*.png
+*.jpg
+*.jpeg
+*.atn
+*.zip
+.DS_Store
+Thumbs.db
+work/
+outputs/
