@@ -50,6 +50,12 @@
         assert(SOCHNO.decide(dull,1280).vibrance>clean.vibrance,'dull images get more global color');
         var dark=sample([[.3,0,0],[.3,.3,0],[0,.3,0],[0,.3,.3],[0,0,.3],[.3,0,.3]]);
         assert(SOCHNO.decide(dark,1280).lift===32,'rich color does not reduce exposure recovery on dark images');
+        // 1.3: dense neon artwork is not brightened or shadow-lifted like a dull photo of the same brightness.
+        var neon=SOCHNO.decide(sample([[.9,.1,.9],[.1,.2,.95],[.95,.75,.05],[.05,.05,.1],[.6,0,.8],[.1,.9,.9]]),1280);
+        var muted=SOCHNO.decide(sample([[.5,.35,.5],[.35,.4,.55],[.55,.5,.35],[.25,.25,.28],[.45,.3,.5],[.35,.5,.5]]),1280);
+        assert(neon.lift<5&&muted.lift>15,'neon keeps its dark density, a muted image of similar brightness is still lifted');
+        assert(neon.shadows<10,'neon shadows are not lifted into grey');
+        assert(neon.saturation>=10&&muted.saturation>neon.saturation,'saturation boost is strong, and stronger for muted colours');
         for(var lift=-14;lift<=32;lift+=23)for(var guard=0;guard<=1;guard+=.5) {
             var pts=SOCHNO.test.curvePoints({lift:lift,contrast:39,toneGuard:guard});
             for(i=1;i<pts.length;i++)assert(pts[i][1]>pts[i-1][1]&&pts[i][1]<=255,'curve is monotonic and bounded');

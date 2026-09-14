@@ -1,5 +1,5 @@
 ﻿#target photoshop
-/* SOCHNO AUTO 1.2 | Adaptive color grading and thumbnail finishing for Photoshop.
+/* SOCHNO AUTO 1.3 | Adaptive color grading and thumbnail finishing for Photoshop.
    Local, self-contained ExtendScript. RGB 8/16-bit. No network or paid plugins.
    One run = one undo step. Regenerates its own group from the unprocessed source.
    Copyright 2026. You may use and modify this script for any of your projects. */
@@ -144,12 +144,12 @@ var SOCHNO = (function () {
         }
         var neutralConfidence=clamp((s.neutralShare-.025)/.12,0,1);
         return {
-            // Colorful artwork often has intentionally dark UI/backgrounds: do not wash them out.
-            lift:clamp((.57-s.mean)*100,-14,32)*(1-densityProtection*.4),contrast:17+flat*22,
-            shadows:round(clamp(8+s.shadows*35+(s.mean<.33?8:0),6,30)*(1-densityProtection*.2)),
+            // Colorful artwork often has intentionally dark UI/backgrounds (neon, casino UI): do not wash them out.
+            lift:clamp((.57-s.mean)*100,-14,32)*(1-densityProtection),contrast:17+flat*22,
+            shadows:round(clamp(8+s.shadows*35+(s.mean<.33?8:0),6,30)*(1-densityProtection*.8)),
             highlights:round(clamp(s.highlights*38,0,12)),
             vibrance:round(clamp(82-rich*22-s.hot*16,30,82)*colorPresence),
-            saturation:round(clamp(12-rich*7-s.hot*6,1,12)*colorPresence),
+            saturation:round(clamp(20-rich*7-s.hot*6,1,20)*colorPresence),
             colorBands:colorBands,
             balance:[clamp(-s.neutral[0]*180,-6,6)*neutralConfidence,
                 clamp(-s.neutral[1]*180,-6,6)*neutralConfidence,
@@ -232,6 +232,16 @@ var SOCHNO = (function () {
         // Normal blending intentionally retains small per-color density changes.
         return adjustment('05 | ГЛУБИНА ЦВЕТА · 6 ДИАПАЗОНОВ',S('hueSaturation'),d);
     }
+    // Blend If on the active layer, "This layer" sliders: black split and white split.
+    function blendIfThisLayer(b0,b1,w0,w1) {
+        var d=new ActionDescriptor(),r=new ActionReference(),layer=new ActionDescriptor(),list=new ActionList(),range=new ActionDescriptor(),ch=new ActionReference();
+        r.putEnumerated(C('Lyr '),C('Ordn'),C('Trgt'));d.putReference(C('null'),r);
+        ch.putEnumerated(C('Chnl'),C('Chnl'),C('Gry '));range.putReference(C('Chnl'),ch);
+        range.putInteger(C('SrcB'),b0);range.putInteger(C('Srcl'),b1);range.putInteger(C('SrcW'),w0);range.putInteger(C('Srcm'),w1);
+        range.putInteger(C('DstB'),0);range.putInteger(C('Dstl'),0);range.putInteger(C('DstW'),255);range.putInteger(C('Dstt'),255);
+        list.putObject(C('Blnd'),range);layer.putList(C('Blnd'),list);d.putObject(C('T   '),C('Lyr '),layer);
+        executeAction(C('setd'),d,DialogModes.NO);
+    }
     function smart() {executeAction(S('newPlacedLayer'),undefined,DialogModes.NO);return app.activeDocument.activeLayer;}
     function usm(amount,radius,threshold) {
         var d=new ActionDescriptor();d.putUnitDouble(C('Amnt'),C('#Prc'),amount);d.putUnitDouble(C('Rds '),C('#Pxl'),radius);d.putInteger(C('Thsh'),threshold);
@@ -258,6 +268,9 @@ var SOCHNO = (function () {
         base.shadowHighlight(round(p.shadows*p.toneGuard),38,round(32*p.scale),round(p.highlights*p.toneGuard),24,round(28*p.scale),0,0,0,0);
         // Separate Luminosity layer prevents colored halos in high-contrast graphics.
         var detail=base.duplicate();doc.activeLayer=detail;detail.name='02 | ОБЪЁМ + ТЕКСТУРА + ЧЁТКОСТЬ · AUTO';detail.blendMode=BlendMode.LUMINOSITY;
+        // Sharpening in Luminosity mode brightened glows and saturated highlights into white. Blend If fades
+        // the detail layer out where it is brighter than 200..250, keeping those colours from the source.
+        blendIfThisLayer(0,0,200,250);
         usm(round(p.clarity*p.detailGuard),clamp(18*p.scale,3,100),p.threshold);
         usm(round(p.texture*p.detailGuard),clamp(2.2*p.scale,.6,12),p.threshold);
         usm(round(p.sharp*p.detailGuard),clamp(.65*p.scale,.35,2.5),p.threshold);
@@ -335,7 +348,7 @@ var SOCHNO = (function () {
             opacity=Math.max(0,opacity-20);group.opacity=opacity;
             result=stats(pixels(merged,128));flags=quality(original,result);accepted=flags.passed;
         }
-        group.name=PREFIX+' 1.2 | ЦВЕТ + ОБЪЁМ · '+opacity+'%';
+        group.name=PREFIX+' 1.3 | ЦВЕТ + ОБЪЁМ · '+opacity+'%';
         return {group:group,before:original,after:result,parameters:p,guardPassed:accepted,outputOpacity:opacity};
     }
     api.lastReport=null;
@@ -389,7 +402,7 @@ var SOCHNO = (function () {
     };
     api.analyze=function(doc){return stats(pixels(doc,128));};
     api.decide=decide;
-    api.version='1.2.0';
+    api.version='1.3.0';
     return api;
 })();
 if(!$.global.SOCHNO_NO_AUTORUN) {
