@@ -1,5 +1,5 @@
 ﻿#target photoshop
-/* SOCHNO AUTO 1.1 | Adaptive color grading and thumbnail finishing for Photoshop.
+/* SOCHNO AUTO 1.2 | Adaptive color grading and thumbnail finishing for Photoshop.
    Local, self-contained ExtendScript. RGB 8/16-bit. No network or paid plugins.
    One run = one undo step. Regenerates its own group from the unprocessed source.
    Copyright 2026. You may use and modify this script for any of your projects. */
@@ -133,7 +133,7 @@ var SOCHNO = (function () {
         var noisy=clamp((s.noise-.004)/.020,0,1),detailed=clamp((s.edge-.045)/.08,0,1);
         var densityProtection=rich*clamp((s.mean-.24)/.15,0,1);
         var colorPresence=clamp((s.chroma-.008)/.055,0,1);
-        var colorBands=[],hueShift=[0,-3,1,3,-2,0],density=[-1,-2,-4,-7,-6,-2];
+        var colorBands=[],hueShift=[0,0,1,3,-2,0],density=[-1,-2,-4,-7,-6,-2];
         for(var i=0;i<6;i++) {
             var b=s.bands[i],headroom=clamp((.88-b.saturation)/.65,0,1);
             // Reds include skin and need a gentler boost; never shift their hue.
@@ -159,13 +159,14 @@ var SOCHNO = (function () {
             texture:round((19+flat*12)*(1-noisy*.65)),
             sharp:round((96-detailed*32)*(1-noisy*.55)),
             threshold:round(2+noisy*5),noiseOpacity:noisy>.35?round(12+noisy*20):0,
-            scale:clamp(width/1280,.25,6),toneGuard:1,detailGuard:1,colorGuard:1,gradeGuard:1,passes:0
+            scale:clamp(width/1280,.25,6),greenGuard:1,toneGuard:1,detailGuard:1,colorGuard:1,gradeGuard:1,passes:0
         };
     }
     function curvePoints(p) {
         var xs=[0,16,48,96,128,176,224,248,255],out=[],last=-1;
         var L=p.lift*p.toneGuard,K=p.contrast*p.toneGuard;
-        var ys=[0,16-K*.23,48+L*.55-K*.6,96+L*.9-K*.3,128+L,176+L*.48+K,224+L*.08+K*.15,248,255];
+        // Deep shadows keep their detail (dark hoodies, outlines): the contrast dip starts above them.
+        var ys=[0,16-K*.1,48+L*.55-K*.45,96+L*.9-K*.3,128+L,176+L*.48+K,224+L*.08+K*.15,248,255];
         for(var i=0;i<xs.length;i++){var v=clamp(round(ys[i]),last+1,255-(xs.length-1-i));out.push([xs[i],v]);last=v;}
         return out;
     }
@@ -184,6 +185,18 @@ var SOCHNO = (function () {
         var layer=adjustment('03 | СВЕТ + КОНТРАСТ · AUTO',C('Crvs'),d);layer.blendMode=BlendMode.LUMINOSITY;
         return layer;
     }
+    // Yellow-green foliage and map land toward clean green. Skin (below ~45 degrees) is outside the range.
+    function lushGreens(p) {
+        var amount=p.colorPresence*p.gradeGuard*p.greenGuard;
+        var d=new ActionDescriptor(),list=new ActionList(),row=new ActionDescriptor();
+        d.putEnumerated(S('presetKind'),S('presetKindType'),S('presetKindCustom'));
+        row.putInteger(S('localRange'),2);
+        row.putInteger(S('beginRamp'),48);row.putInteger(S('beginSustain'),62);
+        row.putInteger(S('endSustain'),98);row.putInteger(S('endRamp'),112);
+        row.putInteger(S('hue'),round(8*amount));row.putInteger(S('saturation'),round(6*amount));row.putInteger(S('lightness'),0);
+        list.putObject(S('hueSatAdjustmentV2'),row);d.putList(S('adjustment'),list);
+        return adjustment('05b | СОЧНАЯ ЗЕЛЕНЬ',S('hueSaturation'),d);
+    }
     function vibrance(p) {
         var d=new ActionDescriptor();d.putInteger(S('vibrance'),round(p.vibrance*p.colorGuard));d.putInteger(S('saturation'),round(p.saturation*p.colorGuard));
         var l=adjustment('06 | СОЧНОСТЬ · AUTO '+round(p.vibrance*p.colorGuard),S('vibrance'),d);l.blendMode=BlendMode.COLORBLEND;return l;
@@ -191,14 +204,15 @@ var SOCHNO = (function () {
     function colorBalance(p) {
         var d=new ActionDescriptor();
         var split=5*p.colorPresence*p.gradeGuard;
-        var values=[[-split,0,split],[p.balance[0]*p.gradeGuard,p.balance[1]*p.gradeGuard,p.balance[2]*p.gradeGuard],[split,0,-split]];
+        // No warm highlight split: it turned greens and whites yellow. Shadows stay slightly cool.
+        var values=[[-split,0,split],[p.balance[0]*p.gradeGuard,p.balance[1]*p.gradeGuard,p.balance[2]*p.gradeGuard],[0,0,0]];
         var keys=['ShdL','MdtL','HghL'];
         for(var i=0;i<3;i++) {
             var list=new ActionList();for(var j=0;j<3;j++)list.putInteger(round(values[i][j]));
             d.putList(C(keys[i]),list);
         }
         d.putBoolean(C('PrsL'),true);
-        var l=adjustment('04 | ЦВЕТОБАЛАНС · ТЁПЛЫЙ СВЕТ / ХОЛОДНЫЕ ТЕНИ',C('ClrB'),d);
+        var l=adjustment('04 | ЦВЕТОБАЛАНС · ЧИСТЫЙ СВЕТ / ХОЛОДНЫЕ ТЕНИ',C('ClrB'),d);
         l.blendMode=BlendMode.COLORBLEND;return l;
     }
     function colorSeparation(p) {
@@ -250,12 +264,13 @@ var SOCHNO = (function () {
         var tone=curves(p);tone.move(group,ElementPlacement.INSIDE);
         doc.activeLayer=tone;var balance=colorBalance(p);balance.move(group,ElementPlacement.INSIDE);
         doc.activeLayer=balance;var palette=colorSeparation(p);palette.move(group,ElementPlacement.INSIDE);
-        doc.activeLayer=palette;var color=vibrance(p);color.move(group,ElementPlacement.INSIDE);
+        doc.activeLayer=palette;var greens=lushGreens(p);greens.move(group,ElementPlacement.INSIDE);
+        doc.activeLayer=greens;var color=vibrance(p);color.move(group,ElementPlacement.INSIDE);
         doc.activeLayer=group;return group;
     }
     function quality(original,result) {
         var flags={white:result.white>original.white+.018,black:result.black>original.black+.015,
-            color:result.colorClip>original.colorClip+.065,saturation:result.hot>original.hot+.12,bands:[],passed:true};
+            color:result.colorClip>original.colorClip+.035,saturation:result.hot>original.hot+.12,bands:[],passed:true};
         for(var i=0;i<6;i++) {
             var before=original.bands[i],after=result.bands[i];
             // Compare occupied image area, avoiding unstable percentages for rare colors.
@@ -272,6 +287,8 @@ var SOCHNO = (function () {
         if(flags.color||flags.saturation)p.colorGuard*=.65;
         var bandFailed=false;
         for(var i=0;i<6;i++)if(flags.bands[i]){p.colorBands[i].guard*=.55;bandFailed=true;}
+        // The green layer works on yellow-green, so a failing yellow or green range weakens it too.
+        if(flags.bands[1]||flags.bands[2])p.greenGuard*=.55;
         // A failing hue can still be driven by global Vibrance. Keep tonal detail intact.
         if(bandFailed&&!flags.color&&!flags.saturation)p.colorGuard*=.78;
         if(flags.color||flags.saturation||bandFailed)p.gradeGuard*=.82;
@@ -318,7 +335,7 @@ var SOCHNO = (function () {
             opacity=Math.max(0,opacity-20);group.opacity=opacity;
             result=stats(pixels(merged,128));flags=quality(original,result);accepted=flags.passed;
         }
-        group.name=PREFIX+' 1.1 | ЦВЕТ + ОБЪЁМ · '+opacity+'%';
+        group.name=PREFIX+' 1.2 | ЦВЕТ + ОБЪЁМ · '+opacity+'%';
         return {group:group,before:original,after:result,parameters:p,guardPassed:accepted,outputOpacity:opacity};
     }
     api.lastReport=null;
@@ -372,7 +389,7 @@ var SOCHNO = (function () {
     };
     api.analyze=function(doc){return stats(pixels(doc,128));};
     api.decide=decide;
-    api.version='1.1.0';
+    api.version='1.2.0';
     return api;
 })();
 if(!$.global.SOCHNO_NO_AUTORUN) {

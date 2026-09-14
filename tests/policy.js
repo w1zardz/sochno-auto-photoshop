@@ -34,6 +34,11 @@
         SOCHNO.test.reduce(p,{white:false,black:false,color:true,saturation:true,bands:[true,false,false,false,false,false]});
         assert(p.colorGuard<1&&p.colorBands[0].guard<1,'color overflow is reduced');
         assert(p.toneGuard===tone&&p.detailGuard===detail,'color overflow preserves light and detail');
+        assert(p.greenGuard===1,'a red-only overflow leaves the green layer alone');
+        var yellowFail=SOCHNO.decide(six,1280);
+        SOCHNO.test.reduce(yellowFail,{white:false,black:false,color:false,saturation:false,bands:[false,true,false,false,false,false]});
+        assert(yellowFail.greenGuard<1,'a yellow overflow weakens the green layer');
+        assert(p.colorBands[0].hue===0&&p.colorBands[1].hue===0,'reds and yellows are never pushed toward orange');
         var color=p.colorGuard;
         SOCHNO.test.reduce(p,{white:true,black:false,color:false,saturation:false,bands:[]});
         assert(p.toneGuard<tone&&p.detailGuard<detail,'tonal overflow reduces tonal effects');
@@ -52,6 +57,8 @@
         assert(SOCHNO.test.quality(six,six).passed,'unchanged rendering passes');
         var bad=sample(primaries);bad.white=six.white+.02;
         assert(!SOCHNO.test.quality(six,bad).passed,'new white clipping fails');
+        var colorBad=sample(primaries);colorBad.colorClip=six.colorClip+.04;
+        assert(!SOCHNO.test.quality(six,colorBad).passed,'4% new colour clipping fails (1.2 limit is 3.5%)');
         if(node)console.log('PASS '+assertions+' policy assertions');
         else $.writeln('PASS '+assertions+' policy assertions');
         return 'PASS '+assertions+' policy assertions';
