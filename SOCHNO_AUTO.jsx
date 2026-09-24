@@ -1,13 +1,16 @@
 ﻿#target photoshop
-/* SOCHNO AUTO 1.3 | Adaptive color grading and thumbnail finishing for Photoshop.
+/* SOCHNO AUTO 2.0 | Adaptive color grading and thumbnail finishing for Photoshop.
+   Per-image analysis drives Camera Raw; full-resolution masks keep each effect where it helps;
+   a quality gate measures the real Photoshop render and retunes it.
    Local, self-contained ExtendScript. RGB 8/16-bit. No network or paid plugins.
    One run = one undo step. Regenerates its own group from the unprocessed source.
    Copyright 2026. You may use and modify this script for any of your projects. */
 var SOCHNO = (function () {
     var api = {}, C = charIDToTypeID, S = stringIDToTypeID;
-    var PREFIX = 'SOCHNO AUTO', MARKER = 'SOCHNO_SOURCE_v1';
+    var PREFIX = 'SOCHNO AUTO', MARKER = 'SOCHNO_SOURCE_v1', TAG = 'SOCHNO_', PASSES = 3;
     function clamp(x,a,b) { return Math.max(a,Math.min(b,x)); }
     function round(x) { return Math.round(x); }
+    function ramp(x,a,b) { return clamp((x-a)/(b-a),0,1); }
     function hue(c,mx,mn) {
         var delta=mx-mn;if(delta<.00001)return 0;
         // ExtendScript associates chained conditional expressions differently from modern JS.
@@ -19,7 +22,10 @@ var SOCHNO = (function () {
     }
     function activeRGB(d) { app.activeDocument=d; d.activeChannels=d.componentChannels; }
     function close(d) { if(d) { try { d.close(SaveOptions.DONOTSAVECHANGES); } catch(e) {} } }
+    function total(hist) { var n=0; for(var i=0;i<256;i++)n+=hist[i]; return n; }
     function q(hist,n,p) { var s=0; for(var i=0;i<256;i++) {s+=hist[i]; if(s>=n*p)return i/255;} return 1; }
+    function frac(hist,lo,hi) { var n=total(hist),s=0; for(var i=lo;i<=hi;i++)s+=hist[i]; return n?s/n:0; }
+    function mean(hist) { var n=total(hist),s=0; for(var i=0;i<256;i++)s+=i*hist[i]; return n?s/n/255:0; }
     function isOurs(g) {
         if(g.typename!=='LayerSet' || g.name.indexOf(PREFIX)!==0)return false;
         for(var i=0;i<g.artLayers.length;i++)if(g.artLayers[i].name===MARKER)return true;
@@ -84,7 +90,7 @@ var SOCHNO = (function () {
     }
     function stats(px) {
         var n=px.rgb.length,h=[],sum=0,sat=0,hot=0,white=0,black=0,colorClip=0,shadow=0,light=0,edge=0,ec=0,res=[],resCount=0;
-        var bands=[],neutral=[0,0,0],neutralN=0,chroma=0;
+        var bands=[],neutral=[0,0,0],neutralN=0,chroma=0,colorful=0,skin=0,flat=0,interior=0;
         for(var bi=0;bi<6;bi++)bands.push({count:0,saturation:0,hot:0,clip:0});
         for(var i=0;i<256;i++)h[i]=0;
         for(i=0;i<n;i++) {
@@ -92,10 +98,13 @@ var SOCHNO = (function () {
             var s=mx>0?(mx-mn)/mx:0;
             chroma+=mx-mn;
             if(s>.12&&y>.06&&y<.94) {
-                var band=bands[Math.floor((hue(c,mx,mn)+30)/60)%6];
+                var hh=hue(c,mx,mn),band=bands[Math.floor((hh+30)/60)%6];
                 band.count++;band.saturation+=s;
                 if(s>.9)band.hot++;
                 if(mx>=.995)band.clip++;
+                if(s>.25)colorful++;
+                // Skin-like: warm hue, moderate saturation, mid lightness. Gold is usually more saturated.
+                if(hh>=8&&hh<=45&&s>.18&&s<.6&&y>.25&&y<.85)skin++;
             }
             // Conservative neutral candidates only; colored scenery is not a white reference.
             if(s<.16&&y>.25&&y<.85) {
@@ -112,8 +121,10 @@ var SOCHNO = (function () {
             var xx=i%px.w,yy=Math.floor(i/px.w);
             if(xx>1&&yy>1&&xx<px.w-2&&yy<px.h-2) {
                 var l=px.y[i-1],r=px.y[i+1],u=px.y[i-px.w],d=px.y[i+px.w];
-                edge+=Math.abs(y-r)+Math.abs(y-d);ec+=2;
+                edge+=Math.abs(y-r)+Math.abs(y-d);ec+=2;interior++;
                 var range=Math.max(l,r,u,d)-Math.min(l,r,u,d);
+                // Flat fills (UI plates, text, map areas) mark graphic rather than photographic content.
+                if(range<.012)flat++;
                 if(range<.055&&y>.05&&y<.9)res[resCount++]=Math.abs(y-(l+r+u+d)/4);
             }
         }
@@ -125,50 +136,194 @@ var SOCHNO = (function () {
         for(ci=0;ci<3;ci++)neutral[ci]/=Math.max(1,neutralN);
         return {mean:sum/n,median:q(h,n,.5),p05:q(h,n,.05),p10:q(h,n,.1),p90:q(h,n,.9),p95:q(h,n,.95),
             saturation:sat/n,hot:hot/n,white:white/n,black:black/n,colorClip:colorClip/n,shadows:shadow/n,highlights:light/n,
-            edge:ec?edge/ec:0,noise:res.length>50?res[Math.floor(res.length*.65)]:0,noiseSamples:res.length,
-            bands:bands,neutral:neutral,neutralShare:neutralN/n,chroma:chroma/n};
+            edge:ec?edge/ec:0,flat:interior?flat/interior:0,noise:res.length>50?res[Math.floor(res.length*.65)]:0,noiseSamples:res.length,
+            bands:bands,neutral:neutral,neutralShare:neutralN/n,chroma:chroma/n,colorful:colorful/n,skin:skin/n};
     }
-    function decide(s,width) {
+    // ---- Full-resolution maps. Photoshop computes them natively; the script only reads histograms.
+    function chRef(name) {
+        var r=new ActionReference(),e={RGB:'RGB ',R:'Rd  ',G:'Grn ',B:'Bl  ',MASK:'Msk '}[name];
+        if(e)r.putEnumerated(C('Chnl'),C('Chnl'),C(e)); else r.putName(C('Chnl'),TAG+name);
+        return r;
+    }
+    function selectChannel(name) {
+        var d=new ActionDescriptor();d.putReference(C('null'),chRef(name));d.putBoolean(C('MkVs'),false);
+        executeAction(C('slct'),d,DialogModes.NO);
+    }
+    function applyImage(src,mode,scale,opacity) {
+        var d=new ActionDescriptor(),s=new ActionDescriptor();s.putReference(C('T   '),chRef(src));
+        s.putEnumerated(C('Clcl'),C('Clcn'),C(mode));if(scale){s.putDouble(C('Scl '),scale);s.putInteger(C('Ofst'),0);}
+        if(opacity)s.putUnitDouble(C('Opct'),C('#Prc'),opacity);
+        d.putObject(C('With'),C('Clcl'),s);executeAction(C('AppI'),d,DialogModes.NO);
+    }
+    // Skin-tone Color Range stored into a new channel; returns its coverage (0..1).
+    function skinRange(doc,name,faces) {
+        channel(doc,name);selectChannel('RGB');
+        try {
+            var d=new ActionDescriptor();d.putInteger(C('Fzns'),20);d.putEnumerated(C('Clrs'),C('Clrs'),S('skinTone'));
+            d.putBoolean(S('UseFacesKey'),faces);executeAction(C('ClrR'),d,DialogModes.NO);
+            doc.selection.store(doc.channels.getByName(TAG+name),SelectionType.REPLACE);
+        } catch(nothing) {}
+        doc.selection.deselect();
+        return mean(histogram(doc,name));
+    }
+    // Alpha channels via Action Manager: several times faster than the DOM collection.
+    function channel(doc,name,src,mode) {
+        var d=new ActionDescriptor();
+        if(src&&!mode&&src!=='RGB') {
+            d.putReference(C('null'),chRef(src));d.putString(C('Nm  '),TAG+name);executeAction(C('Dplc'),d,DialogModes.NO);
+            selectChannel(name);return;
+        }
+        var c=new ActionDescriptor(),clr=new ActionDescriptor();
+        c.putString(C('Nm  '),TAG+name);c.putEnumerated(C('ClrI'),C('MskI'),C('MskA'));
+        clr.putDouble(C('Rd  '),255);clr.putDouble(C('Grn '),0);clr.putDouble(C('Bl  '),0);c.putObject(C('Clr '),C('RGBC'),clr);c.putInteger(C('Opct'),50);
+        d.putObject(C('Nw  '),C('Chnl'),c);executeAction(C('Mk  '),d,DialogModes.NO);
+        selectChannel(name);if(src)applyImage(src,mode||'Nrml');
+    }
+    // Curves on the targeted channel (alpha channel or layer mask).
+    function curve(points) {
+        var d=new ActionDescriptor(),list=new ActionList(),ch=new ActionDescriptor(),r=new ActionReference(),pl=new ActionList();
+        d.putEnumerated(S('presetKind'),S('presetKindType'),S('presetKindCustom'));
+        r.putEnumerated(C('Chnl'),C('Ordn'),C('Trgt'));ch.putReference(C('Chnl'),r);
+        for(var i=0;i<points.length;i++){var pt=new ActionDescriptor();pt.putDouble(C('Hrzn'),points[i][0]);pt.putDouble(C('Vrtc'),points[i][1]);pl.putObject(C('Pnt '),pt);}
+        ch.putList(C('Crv '),pl);list.putObject(C('CrvA'),ch);d.putList(C('Adjs'),list);
+        executeAction(C('Crvs'),d,DialogModes.NO);
+    }
+    function filter(id,radius) {var d=new ActionDescriptor();d.putUnitDouble(C('Rds '),C('#Pxl'),radius);executeAction(C(id),d,DialogModes.NO);}
+    function histogram(doc,name) {var c=doc.channels.getByName(TAG+name),v=c.visible;c.visible=true;var h=c.histogram;c.visible=v;return h;}
+    function removeChannels(names) {
+        for(var i=0;i<names.length;i++){try{var d=new ActionDescriptor();d.putReference(C('null'),chRef(names[i]));executeAction(C('Dlt '),d,DialogModes.NO);}catch(e){}}
+    }
+    function buildMasks(doc,s) {
+        activeRGB(doc);doc.selection.deselect();
+        var sc=clamp(doc.width.as('px')/1280,.25,6),noisy=clamp((s.noise-.004)/.02,0,1);
+        channel(doc,'LUM','RGB');
+        channel(doc,'MAX','R');applyImage('G','Lghn');applyImage('B','Lghn');
+        channel(doc,'MIN','R');applyImage('G','Drkn');applyImage('B','Drkn');
+        channel(doc,'CHR','MAX');applyImage('MIN','Sbtr',1);
+        // DET: areas with in-focus fine detail. |high-pass| is a V curve around 128 with a noise floor;
+        // the blur turns edges into regions. Bokeh, skies, skin and flat fills stay out of the detail layer.
+        channel(doc,'DET','LUM');filter('HghP',Math.max(.5,1.2*sc));
+        var lo=3+6*noisy,hi=22+10*noisy;
+        curve([[0,255],[128-hi,255],[128-lo,0],[128+lo,0],[128+hi,255],[255,255]]);
+        filter('GsnB',8*sc);curve([[0,0],[20,0],[90,255],[255,255]]);
+        // NEU: nearly neutral mid and light tones (white cars, text, UI plates). Layer 05 cleans their tint.
+        channel(doc,'NEU','CHR');curve([[0,255],[6,255],[20,0],[255,0]]);
+        channel(doc,'TMP','LUM');curve([[0,0],[90,0],[150,255],[255,255]]);
+        selectChannel('NEU');applyImage('TMP','Mltp');filter('GsnB',Math.max(.5,sc));
+        // SKIN: Photoshop's skin-tone range with face detection. Without faces it marks every warm tone
+        // (gold, wood, warm whites), so the mask is kept only when face detection clearly narrows it.
+        var withFaces=skinRange(doc,'SKIN',true),anyWarm=skinRange(doc,'SKN2',false);
+        s.faces=withFaces>.002&&withFaces<anyWarm*.8?withFaces:0;
+        removeChannels(s.faces?['SKN2']:['SKN2','SKIN']);
+        if(s.faces) {
+            selectChannel('SKIN');filter('GsnB',Math.max(.5,1.5*sc));
+            // Skin keeps its own texture: half-strength detail on faces and hands.
+            selectChannel('DET');applyImage('SKIN','Sbtr',1,50);
+        }
+        // COL: where the colour layers act. Nearly neutral surfaces of any brightness and skin are
+        // excluded, so Vibrance cannot turn grey stone blue, whites pink or faces orange.
+        channel(doc,'COL','CHR');curve([[0,0],[14,0],[42,255],[255,255]]);
+        if(s.faces)applyImage('SKIN','Sbtr',1);
+        filter('GsnB',Math.max(.5,1.5*sc));
+        // ROOM masks: where the source still had room before black or white. The gate counts only detail
+        // a render really loses there; near-white paper turning white is not a loss.
+        channel(doc,'RHI','MAX');curve([[0,255],[234,255],[242,0],[255,0]]);
+        channel(doc,'RWH','MIN');curve([[0,255],[234,255],[242,0],[255,0]]);
+        channel(doc,'RLO','MAX');curve([[0,0],[8,0],[16,255],[255,255]]);
+        removeChannels(['TMP','MAX','MIN','CHR','LUM']);
+        activeRGB(doc);
+    }
+    // Share of the whole frame inside a source mask whose channel value falls in [lo,hi].
+    function regionFrac(t,mask,name,lo,hi) {
+        var c=null;try{c=t.channels.getByName(TAG+mask);}catch(e){return 0;}
+        t.selection.load(c,SelectionType.REPLACE,false);
+        var h=histogram(t,name),s=0;t.selection.deselect();
+        for(var i=lo;i<=hi;i++)s+=h[i];
+        return s/(t.width.as('px')*t.height.as('px'));
+    }
+    function regionChroma(t,name) {
+        var c=null;try{c=t.channels.getByName(TAG+name);}catch(e){return {c:0,share:0};}
+        t.selection.load(c,SelectionType.REPLACE,false);
+        var h=histogram(t,'MCHR'),n=total(h);t.selection.deselect();
+        return {c:mean(h),share:n/(t.width.as('px')*t.height.as('px'))};
+    }
+    // Exact full-resolution metrics of the visible result, in sRGB like the YouTube export.
+    function measure(doc) {
+        var t=null,m={};
+        try {
+            t=doc.duplicate('SOCHNO measure',true);activeRGB(t);t.selection.deselect();t.flatten();
+            if(t.colorProfileName!=='sRGB IEC61966-2.1')t.convertProfile('sRGB IEC61966-2.1',Intent.RELATIVECOLORIMETRIC,true,false);
+            t.bitsPerChannel=BitsPerChannelType.EIGHT;
+            var hl=t.histogram,n=total(hl);
+            channel(t,'MMAX','R');applyImage('G','Lghn');applyImage('B','Lghn');
+            channel(t,'MMIN','R');applyImage('G','Drkn');applyImage('B','Drkn');
+            channel(t,'MCHR','MMAX');applyImage('MMIN','Sbtr',1);
+            var hx=histogram(t,'MMAX'),hn=histogram(t,'MMIN'),hc=histogram(t,'MCHR');
+            m.crush=frac(hx,0,4);m.clip=frac(hx,254,255);m.white=frac(hn,251,255);m.chroma=mean(hc);
+            m.mean=mean(hl);m.p01=q(hl,n,.01);m.p50=q(hl,n,.5);m.p99=q(hl,n,.99);m.minP05=q(hn,n,.05);
+            // Chroma of surfaces that should stay clean, measured inside the source masks.
+            m.neutral=regionChroma(t,'NEU');m.skin=regionChroma(t,'SKIN');
+            // Detail lost to black or white where the source still had room.
+            m.lostShadows=regionFrac(t,'RLO','MMAX',0,4);m.lostColor=regionFrac(t,'RHI','MMAX',254,255);m.lostWhite=regionFrac(t,'RWH','MMIN',251,255);
+        } finally {close(t);app.activeDocument=doc;}
+        return m;
+    }
+    function decide(s,m,width) {
         var flat=clamp((.72-(s.p90-s.p10))/.5,0,1),rich=clamp((s.saturation-.32)/.4,0,1);
         var noisy=clamp((s.noise-.004)/.020,0,1),detailed=clamp((s.edge-.045)/.08,0,1);
-        var densityProtection=rich*clamp((s.mean-.24)/.15,0,1);
-        var colorPresence=clamp((s.chroma-.008)/.055,0,1);
-        var colorBands=[],hueShift=[0,0,1,3,-2,0],density=[-1,-2,-4,-7,-6,-2];
+        // Colourful artwork often has intentionally dark UI/backgrounds (neon, casino UI): do not wash them out.
+        var density=rich*clamp((s.mean-.24)/.15,0,1);
+        var presence=clamp((s.chroma-.008)/.055,0,1),vivid=ramp(s.chroma,.12,.45),graphic=ramp(s.flat,.25,.6);
+        var colorful=ramp(s.colorful,.08,.35),neutralConfidence=clamp((s.neutralShare-.025)/.12,0,1);
+        var hazy=ramp(m.minP05,.05,.2),base={},detail={},bands=[];
+        // Thumbnails are bright by design: exposure only lifts dark images, it never dims.
+        base.Ex12=Math.round(clamp((.42-s.mean)*1.2,0,.4)*(1-density)*100)/100;
+        base.Cr12=round(12+14*flat-6*ramp(s.p90-s.p10,.8,.95));
+        // Recover bright detail that is not clipped yet; white text, UI and glows keep their full brightness.
+        base.Hi12=-round(clamp(40*s.highlights-10*m.clip,0,14)*(1-ramp(m.white,.01,.04)));
+        base.Sh12=round(clamp(6+40*s.shadows+(s.mean<.33?8:0),4,34)*(1-.7*density));
+        base.Wh12=m.p99<.9?round(clamp((.96-m.p99)*90,0,18)):0;
+        base.Bk12=m.p01>.06?-round(clamp((m.p01-.03)*110,0,18)):round(clamp((m.crush-.03)*140,0,14));
+        base.Dhze=round(2+12*hazy*(1-.5*rich));
+        // Per-colour light: slightly denser blues and purples. Yellow-green toward clean green;
+        // yellow itself is never shifted (gold, titles).
+        base.HA_G=round(7*presence*ramp(s.bands[2].share,.01,.06));
+        base.LA_B=round(-5*presence);base.LA_P=round(-4*presence);base.LA_A=round(-2*presence);
+        // Barely cool shadows; a neutral cast is corrected only with enough near-neutral reference.
+        base.STSH=225;base.STSS=round(5*presence);
+        base.Temp=round(clamp(-(s.neutral[0]-s.neutral[2])*200,-4,4)*neutralConfidence);
+        base.Tint=round(clamp((s.neutral[1]-(s.neutral[0]+s.neutral[2])/2)*200,-4,4)*neutralConfidence);
+        detail.CrTx=round((34+16*flat-4*detailed-6*graphic)*(1-.6*noisy));
+        detail.Cl12=round((18+10*flat-4*detailed-5*graphic)*(1-.4*noisy));
+        detail.Shrp=round((40+16*(1-detailed))*(1-.5*noisy));
+        detail.ShpR=Math.round(clamp(.75+.2*width/1280,.6,2)*10)/10;detail.ShpD=20;detail.ShpM=round(35+35*noisy);
+        if(noisy>.3)detail['LNR ']=round(10+30*noisy);
+        // Dull colour ranges get more, saturated or clipping ones less (never negative). Reds carry skin.
         for(var i=0;i<6;i++) {
-            var b=s.bands[i],headroom=clamp((.88-b.saturation)/.65,0,1);
-            // Reds include skin and need a gentler boost; never shift their hue.
-            var boost=(i===0?5:12)+(i===0?10:24)*headroom-b.hot*7-b.clip*6;
-            colorBands.push({hue:hueShift[i]*colorPresence,
-                saturation:round(clamp(boost,0,32)*colorPresence),
-                lightness:round(density[i]*colorPresence*(.65+.35*rich)),guard:1});
+            var b=s.bands[i],boost=6+18*ramp(.88-b.saturation,0,.6)-25*b.hot-15*b.clip;
+            if(i===0)boost=Math.min(boost,12);
+            bands.push(round(clamp(boost,0,24)*presence));
         }
-        var neutralConfidence=clamp((s.neutralShare-.025)/.12,0,1);
-        return {
-            // Colorful artwork often has intentionally dark UI/backgrounds (neon, casino UI): do not wash them out.
-            lift:clamp((.57-s.mean)*100,-14,32)*(1-densityProtection),contrast:17+flat*22,
-            shadows:round(clamp(8+s.shadows*35+(s.mean<.33?8:0),6,30)*(1-densityProtection*.8)),
-            highlights:round(clamp(s.highlights*38,0,12)),
-            vibrance:round(clamp(82-rich*22-s.hot*16,30,82)*colorPresence),
-            saturation:round(clamp(20-rich*7-s.hot*6,1,20)*colorPresence),
-            colorBands:colorBands,
-            balance:[clamp(-s.neutral[0]*180,-6,6)*neutralConfidence,
-                clamp(-s.neutral[1]*180,-6,6)*neutralConfidence,
-                clamp(-s.neutral[2]*180,-6,6)*neutralConfidence],
-            colorPresence:colorPresence,
-            clarity:round((31+flat*16-detailed*10)*(1-noisy*.45)),
-            texture:round((19+flat*12)*(1-noisy*.65)),
-            sharp:round((96-detailed*32)*(1-noisy*.55)),
-            threshold:round(2+noisy*5),noiseOpacity:noisy>.35?round(12+noisy*20):0,
-            scale:clamp(width/1280,.25,6),greenGuard:1,toneGuard:1,detailGuard:1,colorGuard:1,gradeGuard:1,passes:0
-        };
+        return {base:base,detail:detail,
+            color:{vibrance:round((30+20*(1-vivid))*presence),saturation:round(clamp(6+10*(1-vivid)-6*s.hot,0,14)*presence),bands:bands},
+            neutral:-round((40+25*ramp(m.neutral.c,.01,.04))*ramp(m.neutral.share,.002,.02)),
+            // Upper bound for the measured chroma gain; muted images may gain more before looking painted.
+            colorCeiling:.18+.25*(1-vivid)*(.5+.5*colorful),colorScale:1,presence:presence,passes:0,clipTries:0,guards:[],log:[]};
     }
-    function curvePoints(p) {
-        var xs=[0,16,48,96,128,176,224,248,255],out=[],last=-1;
-        var L=p.lift*p.toneGuard,K=p.contrast*p.toneGuard;
-        // Deep shadows keep their detail (dark hoodies, outlines): the contrast dip starts above them.
-        var ys=[0,16-K*.1,48+L*.55-K*.45,96+L*.9-K*.3,128+L,176+L*.48+K,224+L*.08+K*.15,248,255];
-        for(var i=0;i<xs.length;i++){var v=clamp(round(ys[i]),last+1,255-(xs.length-1-i));out.push([xs[i],v]);last=v;}
-        return out;
+    function merged(a,b) {
+        var o={},k;for(k in a)if(a.hasOwnProperty(k))o[k]=a[k];
+        for(k in b)if(b.hasOwnProperty(k))o[k]=b[k];
+        return o;
+    }
+    // Camera Raw as a smart filter on the active smart object.
+    function acr(settings) {
+        var d=new ActionDescriptor();d.putString(C('CMod'),'Filter');d.putEnumerated(C('Sett'),C('Sett'),C('Cst '));
+        for(var k in settings)if(settings.hasOwnProperty(k)&&isFinite(settings[k])) {
+            // "||0" turns -0 into 0: Action Manager rejects negative zero as an invalid argument.
+            if(k==='Ex12'||k==='ShpR')d.putDouble(C(k),settings[k]||0); else d.putInteger(C(k),round(settings[k])||0);
+        }
+        try{executeAction(S('Adobe Camera Raw Filter'),d,DialogModes.NO);}
+        catch(e){throw Error('Не удалось применить Camera Raw Filter. Проверь, что он есть в меню Фильтр → Camera Raw.\n'+e.message);}
     }
     function adjustment(name,type,settings) {
         var d=new ActionDescriptor(),r=new ActionReference(),u=new ActionDescriptor();
@@ -176,61 +331,14 @@ var SOCHNO = (function () {
         u.putObject(C('Type'),type,settings);d.putObject(C('Usng'),S('adjustmentLayer'),u);
         executeAction(C('Mk  '),d,DialogModes.NO);return app.activeDocument.activeLayer;
     }
-    function curves(p) {
-        var d=new ActionDescriptor(),a=new ActionList(),ch=new ActionDescriptor(),r=new ActionReference(),pts=new ActionList();
-        r.putEnumerated(C('Chnl'),C('Chnl'),C('Cmps'));ch.putReference(C('Chnl'),r);
-        var points=curvePoints(p);
-        for(var i=0;i<points.length;i++){var pt=new ActionDescriptor();pt.putDouble(C('Hrzn'),points[i][0]);pt.putDouble(C('Vrtc'),points[i][1]);pts.putObject(C('Pnt '),pt);}
-        ch.putList(C('Crv '),pts);a.putObject(C('CrvA'),ch);d.putList(C('Adjs'),a);
-        var layer=adjustment('03 | СВЕТ + КОНТРАСТ · AUTO',C('Crvs'),d);layer.blendMode=BlendMode.LUMINOSITY;
-        return layer;
-    }
-    // Yellow-green foliage and map land toward clean green. Skin (below ~45 degrees) is outside the range.
-    function lushGreens(p) {
-        var amount=p.colorPresence*p.gradeGuard*p.greenGuard;
-        var d=new ActionDescriptor(),list=new ActionList(),row=new ActionDescriptor();
-        d.putEnumerated(S('presetKind'),S('presetKindType'),S('presetKindCustom'));
-        row.putInteger(S('localRange'),2);
-        row.putInteger(S('beginRamp'),48);row.putInteger(S('beginSustain'),62);
-        row.putInteger(S('endSustain'),98);row.putInteger(S('endRamp'),112);
-        row.putInteger(S('hue'),round(8*amount));row.putInteger(S('saturation'),round(6*amount));row.putInteger(S('lightness'),0);
-        list.putObject(S('hueSatAdjustmentV2'),row);d.putList(S('adjustment'),list);
-        return adjustment('05b | СОЧНАЯ ЗЕЛЕНЬ',S('hueSaturation'),d);
-    }
-    function vibrance(p) {
-        var d=new ActionDescriptor();d.putInteger(S('vibrance'),round(p.vibrance*p.colorGuard));d.putInteger(S('saturation'),round(p.saturation*p.colorGuard));
-        var l=adjustment('06 | СОЧНОСТЬ · AUTO '+round(p.vibrance*p.colorGuard),S('vibrance'),d);l.blendMode=BlendMode.COLORBLEND;return l;
-    }
-    function colorBalance(p) {
-        var d=new ActionDescriptor();
-        var split=5*p.colorPresence*p.gradeGuard;
-        // No warm highlight split: it turned greens and whites yellow. Shadows stay slightly cool.
-        var values=[[-split,0,split],[p.balance[0]*p.gradeGuard,p.balance[1]*p.gradeGuard,p.balance[2]*p.gradeGuard],[0,0,0]];
-        var keys=['ShdL','MdtL','HghL'];
-        for(var i=0;i<3;i++) {
-            var list=new ActionList();for(var j=0;j<3;j++)list.putInteger(round(values[i][j]));
-            d.putList(C(keys[i]),list);
+    // Copy a full-resolution map into the active layer's mask.
+    function maskFrom(name,hasMask) {
+        if(!hasMask) {
+            var d=new ActionDescriptor(),r=new ActionReference();d.putClass(C('Nw  '),C('Chnl'));
+            r.putEnumerated(C('Chnl'),C('Chnl'),C('Msk '));d.putReference(C('At  '),r);d.putEnumerated(C('Usng'),C('UsrM'),C('RvlA'));
+            executeAction(C('Mk  '),d,DialogModes.NO);
         }
-        d.putBoolean(C('PrsL'),true);
-        var l=adjustment('04 | ЦВЕТОБАЛАНС · ЧИСТЫЙ СВЕТ / ХОЛОДНЫЕ ТЕНИ',C('ClrB'),d);
-        l.blendMode=BlendMode.COLORBLEND;return l;
-    }
-    function colorSeparation(p) {
-        var d=new ActionDescriptor(),list=new ActionList();
-        d.putEnumerated(S('presetKind'),S('presetKindType'),S('presetKindCustom'));
-        for(var i=0;i<6;i++) {
-            var b=p.colorBands[i],row=new ActionDescriptor(),center=i*60;
-            row.putInteger(S('localRange'),i+1);
-            row.putInteger(S('beginRamp'),(center+315)%360);row.putInteger(S('beginSustain'),(center+345)%360);
-            row.putInteger(S('endSustain'),(center+15)%360);row.putInteger(S('endRamp'),(center+45)%360);
-            row.putInteger(S('hue'),round(b.hue*p.gradeGuard));
-            row.putInteger(S('saturation'),round(b.saturation*b.guard*p.gradeGuard));
-            row.putInteger(S('lightness'),round(b.lightness*p.gradeGuard));
-            list.putObject(S('hueSatAdjustmentV2'),row);
-        }
-        d.putList(S('adjustment'),list);
-        // Normal blending intentionally retains small per-color density changes.
-        return adjustment('05 | ГЛУБИНА ЦВЕТА · 6 ДИАПАЗОНОВ',S('hueSaturation'),d);
+        selectChannel('MASK');applyImage(name,'Nrml');selectChannel('RGB');
     }
     // Blend If on the active layer, "This layer" sliders: black split and white split.
     function blendIfThisLayer(b0,b1,w0,w1) {
@@ -243,113 +351,139 @@ var SOCHNO = (function () {
         executeAction(C('setd'),d,DialogModes.NO);
     }
     function smart() {executeAction(S('newPlacedLayer'),undefined,DialogModes.NO);return app.activeDocument.activeLayer;}
-    function usm(amount,radius,threshold) {
-        var d=new ActionDescriptor();d.putUnitDouble(C('Amnt'),C('#Prc'),amount);d.putUnitDouble(C('Rds '),C('#Pxl'),radius);d.putInteger(C('Thsh'),threshold);
-        executeAction(C('UnsM'),d,DialogModes.NO);
+    // Colour lives in adjustment layers in Color mode: they keep the light untouched, are cheap to
+    // retune and stay editable in Properties. The COL mask keeps them off neutrals and skin.
+    function colorLayers(doc,p,belowId) {
+        var ids=[],sc=p.colorScale,c=p.color;selectLayerId(doc,belowId);
+        if(p.presence>.02) {
+            var v=new ActionDescriptor();v.putInteger(S('vibrance'),round(c.vibrance*sc)||0);v.putInteger(S('saturation'),round(c.saturation*sc)||0);
+            var vl=adjustment('03 | СОЧНОСТЬ · '+round(c.vibrance*sc),S('vibrance'),v);vl.blendMode=BlendMode.COLORBLEND;maskFrom('COL',true);ids.push(vl.id);
+            var d=new ActionDescriptor(),list=new ActionList();
+            d.putEnumerated(S('presetKind'),S('presetKindType'),S('presetKindCustom'));
+            for(var i=0;i<6;i++) {
+                var row=new ActionDescriptor(),center=i*60;
+                row.putInteger(S('localRange'),i+1);
+                row.putInteger(S('beginRamp'),(center+315)%360);row.putInteger(S('beginSustain'),(center+345)%360);
+                row.putInteger(S('endSustain'),(center+15)%360);row.putInteger(S('endRamp'),(center+45)%360);
+                row.putInteger(S('hue'),0);row.putInteger(S('saturation'),round(c.bands[i]*sc)||0);row.putInteger(S('lightness'),0);
+                list.putObject(S('hueSatAdjustmentV2'),row);
+            }
+            d.putList(S('adjustment'),list);
+            var bl=adjustment('04 | ГЛУБИНА ЦВЕТА · 6 ДИАПАЗОНОВ',S('hueSaturation'),d);bl.blendMode=BlendMode.COLORBLEND;maskFrom('COL',true);ids.push(bl.id);
+        }
+        if(p.neutral<0) {
+            var hs=new ActionDescriptor(),hl=new ActionList(),master=new ActionDescriptor();
+            hs.putEnumerated(S('presetKind'),S('presetKindType'),S('presetKindCustom'));
+            master.putInteger(C('H   '),0);master.putInteger(C('Strt'),p.neutral||0);master.putInteger(C('Lght'),0);
+            hl.putObject(C('Hst2'),master);hs.putList(C('Adjs'),hl);
+            var nl=adjustment('05 | ЧИСТЫЕ БЕЛЫЕ И СЕРЫЕ · '+(-p.neutral)+'%',C('HStr'),hs);maskFrom('NEU',true);ids.push(nl.id);
+        }
+        return ids;
     }
     function render(doc,p) {
         activeRGB(doc);doc.selection.deselect();
         var source=doc.activeLayer;source.name=MARKER;
-        var group=doc.layerSets.add();group.name=PREFIX+' | ЖЁСТКИЙ АВТОФИНИШ';group.blendMode=BlendMode.NORMAL;
+        var group=doc.layerSets.add();group.name=PREFIX+' | ЦВЕТ + ОБЪЁМ';group.blendMode=BlendMode.NORMAL;
         source.move(group,ElementPlacement.INSIDE);doc.activeLayer=source;
         source=smart();source.name=MARKER;
-        var base=source;
-        if(p.noiseOpacity>0) {
-            var smooth=source.duplicate();doc.activeLayer=smooth;
-            executeAction(C('Mdn '),(function(){var d=new ActionDescriptor();d.putUnitDouble(C('Rds '),C('#Pxl'),1);return d;})(),DialogModes.NO);
-            smooth.name='00 | МЯГКОЕ ПОДАВЛЕНИЕ ШУМА';smooth.opacity=p.noiseOpacity;smooth.blendMode=BlendMode.LUMINOSITY;
-            // Keep the original marker, but use a rendered composite for subsequent detail passes.
-            var temp=doc.duplicate('SOCHNO denoise merge',true);
-            var merged=temp.activeLayer.duplicate(doc,ElementPlacement.PLACEATBEGINNING);close(temp);activeRGB(doc);
-            merged.move(group,ElementPlacement.INSIDE);doc.activeLayer=merged;base=smart();base.name='01 | БАЗА ПОСЛЕ ШУМА';
-        }
-        // Local tonal recovery, with no black/white percentile clipping.
-        doc.activeLayer=base;
-        base.shadowHighlight(round(p.shadows*p.toneGuard),38,round(32*p.scale),round(p.highlights*p.toneGuard),24,round(28*p.scale),0,0,0,0);
-        // Separate Luminosity layer prevents colored halos in high-contrast graphics.
-        var detail=base.duplicate();doc.activeLayer=detail;detail.name='02 | ОБЪЁМ + ТЕКСТУРА + ЧЁТКОСТЬ · AUTO';detail.blendMode=BlendMode.LUMINOSITY;
-        // Sharpening in Luminosity mode brightened glows and saturated highlights into white. Blend If fades
-        // the detail layer out where it is brighter than 200..250, keeping those colours from the source.
-        blendIfThisLayer(0,0,200,250);
-        usm(round(p.clarity*p.detailGuard),clamp(18*p.scale,3,100),p.threshold);
-        usm(round(p.texture*p.detailGuard),clamp(2.2*p.scale,.6,12),p.threshold);
-        usm(round(p.sharp*p.detailGuard),clamp(.65*p.scale,.35,2.5),p.threshold);
-        var tone=curves(p);tone.move(group,ElementPlacement.INSIDE);
-        doc.activeLayer=tone;var balance=colorBalance(p);balance.move(group,ElementPlacement.INSIDE);
-        doc.activeLayer=balance;var palette=colorSeparation(p);palette.move(group,ElementPlacement.INSIDE);
-        doc.activeLayer=palette;var greens=lushGreens(p);greens.move(group,ElementPlacement.INSIDE);
-        doc.activeLayer=greens;var color=vibrance(p);color.move(group,ElementPlacement.INSIDE);
-        doc.activeLayer=group;return group;
+        // Both Camera Raw layers start from the same untouched source: one pass each.
+        var detail=source.duplicate();
+        doc.activeLayer=source;acr(p.base);
+        doc.activeLayer=detail;detail.name='02 | ОБЪЁМ + ТЕКСТУРА + РЕЗКОСТЬ · В ФОКУСЕ';
+        acr(merged(p.base,p.detail));detail.blendMode=BlendMode.LUMINOSITY;
+        // Detail fades out in deep shadows and near white, where it would crush or clip.
+        blendIfThisLayer(0,12,225,250);maskFrom('DET',false);
+        var detailId=detail.id;
+        return {group:group,detailId:detailId,color:colorLayers(doc,p,detailId)};
     }
-    function quality(original,result) {
-        var flags={white:result.white>original.white+.018,black:result.black>original.black+.015,
-            color:result.colorClip>original.colorClip+.035,saturation:result.hot>original.hot+.12,bands:[],passed:true};
-        for(var i=0;i<6;i++) {
-            var before=original.bands[i],after=result.bands[i];
-            // Compare occupied image area, avoiding unstable percentages for rare colors.
-            var bad=before.share>.025 && (after.hot*after.share>before.hot*before.share+.035 ||
-                after.clip*after.share>before.clip*before.share+.025);
-            flags.bands.push(bad);
-        }
-        flags.passed=!(flags.white||flags.black||flags.color||flags.saturation);
-        for(i=0;i<6;i++)if(flags.bands[i])flags.passed=false;
-        return flags;
+    function recolor(doc,r,p) {
+        for(var i=r.color.length-1;i>=0;i--)deleteLayerId(r.color[i]);
+        r.color=colorLayers(doc,p,r.detailId);
     }
-    function reduce(p,flags) {
-        if(flags.white||flags.black){p.toneGuard*=.72;p.detailGuard*=.72;}
-        if(flags.color||flags.saturation)p.colorGuard*=.65;
-        var bandFailed=false;
-        for(var i=0;i<6;i++)if(flags.bands[i]){p.colorBands[i].guard*=.55;bandFailed=true;}
-        // The green layer works on yellow-green, so a failing yellow or green range weakens it too.
-        if(flags.bands[1]||flags.bands[2])p.greenGuard*=.55;
-        // A failing hue can still be driven by global Vibrance. Keep tonal detail intact.
-        if(bandFailed&&!flags.color&&!flags.saturation)p.colorGuard*=.78;
-        if(flags.color||flags.saturation||bandFailed)p.gradeGuard*=.82;
+    function quality(before,after,p) {
+        var gain=before.chroma>.005?after.chroma/before.chroma-1:0;
+        var f={gain:gain,crush:after.lostShadows-before.lostShadows>.006,clip:after.lostColor-before.lostColor>.02,white:after.lostWhite-before.lostWhite>.006,
+            neutral:before.neutral.share>.004&&after.neutral.c>before.neutral.c*1.05+.002,
+            skin:before.skin.share>.01&&after.skin.c>before.skin.c*1.12+.004,
+            dark:after.mean<before.mean-.04,bright:after.mean>before.mean+.1};
+        f.colorHigh=gain>p.colorCeiling;
+        f.passed=!(f.crush||f.clip||f.white||f.neutral||f.skin||f.dark||f.bright);
+        return f;
     }
-    function analyzeAndRender(merged) {
-        var original=stats(pixels(merged,128));
+    // Adjust only what caused a failure. Returns true when Camera Raw has to run again;
+    // colour and neutral corrections just rebuild the cheap adjustment layers.
+    function reduce(p,f) {
+        var b=p.base,d=p.detail,toneClip=f.clip&&p.clipTries>0;
+        if(f.crush){b.Bk12+=8;b.Sh12+=6;b.Cr12-=4;b.Dhze=Math.max(0,b.Dhze-3);d.Cl12=round(d.Cl12*.75);p.guards.push('shadows');}
+        // New clipping is first answered with less colour; if it stays, contrast and highlights give way.
+        if(f.white||toneClip){b.Cr12=Math.max(0,b.Cr12-5);d.Cl12=round(d.Cl12*.8);b.Hi12-=6;b.Wh12-=4;
+            if(b.Ex12>0)b.Ex12=Math.round(b.Ex12*60)/100;p.guards.push('highlights');}
+        if(f.clip){p.colorScale*=.75;p.clipTries++;p.guards.push('color');}
+        if(f.neutral){p.neutral=Math.max(-90,Math.min(p.neutral,-40)-15);p.guards.push('neutral');}
+        if(f.skin){b.Dhze=Math.max(0,b.Dhze-3);b.Temp=round(b.Temp/2);b.Cr12-=3;p.colorScale*=.9;p.guards.push('skin');}
+        if(f.dark){b.Ex12=Math.round((b.Ex12+.1)*100)/100;b.Sh12+=6;p.guards.push('exposure');}
+        if(f.bright){b.Ex12=Math.round((b.Ex12-.1)*100)/100;p.guards.push('exposure');}
+        if(f.colorHigh)p.colorScale*=clamp(.85*p.colorCeiling/Math.max(f.gain,.01),.3,.9);
+        p.colorScale=clamp(p.colorScale,.2,1);
+        return !!(f.crush||f.white||toneClip||f.skin||f.dark||f.bright);
+    }
+    function describe(before,after,f) {
+        var out=['chroma '+(f.gain>=0?'+':'')+Math.round(f.gain*100)+'%'],names=['crush','clip','white','neutral','skin','dark','bright','colorHigh'];
+        for(var i=0;i<names.length;i++)if(f[names[i]])out.push(names[i]);
+        return out.join(', ');
+    }
+    function copy(p) {
+        var o={},k;for(k in p)if(p.hasOwnProperty(k))o[k]=(p[k]&&typeof p[k]==='object'&&!(p[k] instanceof Array))?merged(p[k],{}):p[k];
+        o.guards=p.guards.slice(0);o.log=p.log.slice(0);return o;
+    }
+    function analyzeAndRender(work) {
+        var started=new Date().getTime(),timing=[],tick=started;
+        function lap(name){var t=new Date().getTime();timing.push(name+':'+(t-tick));tick=t;}
+        var s=stats(pixels(work,128));lap('stats');
         // Estimate noise from full-size high-frequency luminance, not from a tiny
         // thumbnail where letters and textures can be mistaken for noise.
         var noiseDoc=null;
         try {
-            noiseDoc=merged.duplicate('SOCHNO noise analysis',true);activeRGB(noiseDoc);
+            noiseDoc=work.duplicate('SOCHNO noise analysis',true);activeRGB(noiseDoc);
             noiseDoc.bitsPerChannel=BitsPerChannelType.EIGHT;
-            noiseDoc.activeLayer.applyHighPass(clamp(.6*merged.width.as('px')/1280,.5,3));
-            var hist=noiseDoc.histogram,total=0;
-            for(var ni=0;ni<hist.length;ni++)total+=hist[ni];
-            original.noise=(q(hist,total,.75)-q(hist,total,.25))/2;
-        } finally {close(noiseDoc);app.activeDocument=merged;}
-        var p=decide(original,merged.width.as('px'));
-        var trial=null,result,accepted=false,flags;
-        // Evaluate actual Photoshop rendering, not just the intended slider values.
-        for(var k=0;k<5;k++) {
-            try {
-                trial=merged.duplicate('SOCHNO quality check',true);activeRGB(trial);
-                var ratio=Math.min(1,640/Math.max(trial.width.as('px'),trial.height.as('px')));
-                if(ratio<1)trial.resizeImage(UnitValue(round(trial.width.as('px')*ratio),'px'),UnitValue(round(trial.height.as('px')*ratio),'px'),null,ResampleMethod.BICUBIC);
-                // Compare at the same preview scale; resizing alone can change clipping counts.
-                var previewOriginal=stats(pixels(trial,128));
-                var fullScale=p.scale;
-                try {p.scale=fullScale*ratio;render(trial,p);} finally {p.scale=fullScale;}
-                result=stats(pixels(trial,128));p.passes=k+1;
-                flags=quality(previewOriginal,result);
-                if(flags.passed){accepted=true;break;}
-                if(k<4)reduce(p,flags);
-            } finally {close(trial);trial=null;app.activeDocument=merged;}
+            noiseDoc.activeLayer.applyHighPass(clamp(.6*work.width.as('px')/1280,.5,3));
+            var hist=noiseDoc.histogram,n=total(hist);
+            s.noise=(q(hist,n,.75)-q(hist,n,.25))/2;
+        } finally {close(noiseDoc);app.activeDocument=work;}
+        lap('noise');buildMasks(work,s);lap('masks');
+        var before=measure(work);lap('measure0');
+        var p=decide(s,before,work.width.as('px')),r=null,after=null,flags=null,lastPassed=null,full=true;
+        var passes=PASSES;
+        // Measure the real render; tone or detail problems re-run Camera Raw, colour-only ones just retune colour.
+        for(var k=0;k<passes;k++) {
+            if(full) {
+                if(r){deleteLayerId(r.group.id);work.activeLayer=work.layers[0];}
+                var backdrop=work.activeLayer;backdrop.duplicate();work.activeLayer=backdrop;
+                r=render(work,p);
+            } else recolor(work,r,p);
+            p.passes=k+1;lap((full?'render':'recolor')+k);
+            after=measure(work);flags=quality(before,after,p);lap('measure'+(k+1));
+            p.log.push('pass '+(k+1)+': '+describe(before,after,flags));
+            if(flags.passed)lastPassed=copy(p);
+            if(flags.passed&&!flags.colorHigh)break;
+            if(k===passes-1)break;
+            full=reduce(p,flags);
         }
-        var finalSource=merged.activeLayer;
-        finalSource.duplicate();merged.activeLayer=finalSource;
-        var group=render(merged,p);
-        // Check the final full-size render too. If the limited search cannot pass,
-        // blend toward the original and verify each fallback rather than silently shipping a failure.
-        result=stats(pixels(merged,128));flags=quality(original,result);accepted=flags.passed;
+        // A later retune can fail where an earlier pass was fine: rebuild that one.
+        if(!flags.passed&&lastPassed) {
+            deleteLayerId(r.group.id);work.activeLayer=work.layers[0];
+            p=lastPassed;var bd=work.activeLayer;bd.duplicate();work.activeLayer=bd;
+            r=render(work,p);after=measure(work);flags=quality(before,after,p);lap('restore');
+        }
+        // Still failing: blend toward the original and verify each step rather than silently shipping a failure.
         var opacity=100;
-        while(!accepted&&opacity>0) {
-            opacity=Math.max(0,opacity-20);group.opacity=opacity;
-            result=stats(pixels(merged,128));flags=quality(original,result);accepted=flags.passed;
+        while(!flags.passed&&opacity>0) {
+            opacity=Math.max(0,opacity-20);r.group.opacity=opacity;
+            after=measure(work);flags=quality(before,after,p);
         }
-        group.name=PREFIX+' 1.3 | ЦВЕТ + ОБЪЁМ · '+opacity+'%';
-        return {group:group,before:original,after:result,parameters:p,guardPassed:accepted,outputOpacity:opacity};
+        r.group.name=PREFIX+' 2.0 | ЦВЕТ + ОБЪЁМ · '+opacity+'%';
+        return {group:r.group,before:before,after:after,stats:s,parameters:p,flags:flags,guardPassed:flags.passed,outputOpacity:opacity,
+            ms:new Date().getTime()-started,timing:timing.join(' ')};
     }
     api.lastReport=null;
     api.run=function () {
@@ -384,7 +518,8 @@ var SOCHNO = (function () {
             // Only replace groups created by this script and bearing its source marker.
             for(i=prev.length-1;i>=0;i--)deleteLayerId(prev[i].id);
             output=selectLayerId(src,outputId);output.visible=true;output.name=finalName;activeRGB(src);
-            api.lastReport={version:api.version,before:report.before,after:report.after,parameters:report.parameters,guardPassed:report.guardPassed,outputOpacity:report.outputOpacity,groupId:outputId};
+            api.lastReport={version:api.version,before:report.before,after:report.after,stats:report.stats,parameters:report.parameters,
+                flags:report.flags,guardPassed:report.guardPassed,outputOpacity:report.outputOpacity,groupId:outputId,ms:report.ms,timing:report.timing};
         };
         try {
             app.displayDialogs=DialogModes.NO;app.preferences.rulerUnits=Units.PIXELS;
@@ -402,7 +537,7 @@ var SOCHNO = (function () {
     };
     api.analyze=function(doc){return stats(pixels(doc,128));};
     api.decide=decide;
-    api.version='1.3.0';
+    api.version='2.0.0';
     return api;
 })();
 if(!$.global.SOCHNO_NO_AUTORUN) {

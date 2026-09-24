@@ -44,7 +44,7 @@
         assert(r.outputOpacity>0,name+': must produce a visible effect');
         assert(app.documents.length===beforeDocs,name+': no temporary documents leaked');
         assert(doc.colorProfileName===profile&&doc.bitsPerChannel===depth,name+': preserve profile and depth');
-        log('PASS '+name+' '+(new Date().getTime()-start)+'ms opacity='+r.outputOpacity+' tone='+r.parameters.toneGuard+' color='+r.parameters.colorGuard+' trials='+r.parameters.passes);
+        log('PASS '+name+' '+(new Date().getTime()-start)+'ms opacity='+r.outputOpacity+' colorScale='+r.parameters.colorScale+' passes='+r.parameters.passes+' guards='+r.parameters.guards.join('+')+' faces='+r.stats.faces+' | '+r.timing);
         return r;
     }
     var init=File(out+'/results.txt');init.open('w');init.close();
@@ -98,9 +98,9 @@
             if(name==='rgb16')doc.bitsPerChannel=BitsPerChannelType.SIXTEEN;
             if(name==='grayscale')doc.activeLayer.desaturate();
             var history=doc.activeHistoryState;r=run(name);
-            if(name==='normal')assert(r.parameters.colorBands[4].saturation>r.parameters.colorBands[0].saturation,'boost blues more than rich reds');
-            if(name==='grayscale')assert(r.parameters.colorPresence<.05&&r.after.chroma<.01,'do not colorize monochrome');
-            if(name==='noisy')assert(r.parameters.noiseOpacity>0,'detect added noise');
+            if(name==='normal')assert(r.parameters.color.bands[0]<=10&&r.after.crush-r.before.crush<=.008,'reds stay gentle, no new crushed blacks');
+            if(name==='grayscale')assert(r.parameters.presence<.05&&r.after.chroma<.01,'do not colorize monochrome');
+            if(name==='noisy')assert(r.parameters.detail['LNR ']>0,'detect added noise');
             exportPreview(doc,name);
             doc.activeHistoryState=history;assert(doc.layerSets.length===0,'undo removes new group on flat document');
             doc.close(SaveOptions.DONOTSAVECHANGES);doc=null;
@@ -112,8 +112,8 @@
         // Force the full-size fallback search to its neutral endpoint. It must
         // blend with the original, not with a transparent/white canvas.
         doc=base.duplicate('SOCHNO fallback endpoint',true);
-        var fallbackCode=code.replace(/^\uFEFF?#target[^\n]*/m,'').replace('for(var k=0;k<5;k++)','for(var k=0;k<0;k++)')
-            .replace('flags.passed=!(flags.white||flags.black||flags.color||flags.saturation);','flags.passed=Math.abs(original.mean-result.mean)<.0000001;');
+        var fallbackCode=code.replace(/^\uFEFF?#target[^\n]*/m,'').replace('PASSES = 3','PASSES = 1')
+            .replace('f.passed=!(f.crush||f.clip||f.white||f.neutral||f.skin||f.dark||f.bright);','f.passed=Math.abs(before.mean-after.mean)<.0000001&&Math.abs(before.chroma-after.chroma)<.0000001;');
         eval(fallbackCode);r=SOCHNO.run();
         assert(r.guardPassed&&r.outputOpacity===0,'fallback reaches unchanged source when needed');
         assert(Math.abs(r.before.mean-r.after.mean)<.0000001&&Math.abs(r.before.chroma-r.after.chroma)<.0000001,'fallback report reflects original pixels');

@@ -11,13 +11,24 @@
     }
     var charIDToTypeID=function(v){return v;},stringIDToTypeID=function(v){return v;};
     // Expose pure functions only in the test copy; production API stays small.
-    text=text.replace(/^\uFEFF?#target[^\n]*/m,'').replace('api.decide=decide;',
-        'api.decide=decide;api.test={stats:stats,hue:hue,curvePoints:curvePoints,quality:quality,reduce:reduce};');
+    text=text.replace(new RegExp('^'+String.fromCharCode(0xFEFF)+'?#target[^'+String.fromCharCode(10)+']*','m'),'').replace('api.decide=decide;',
+        'api.decide=decide;api.test={stats:stats,hue:hue,quality:quality,reduce:reduce,merged:merged,copy:copy};');
     var assertions=0;
     function assert(ok,msg){assertions++;if(!ok)throw Error('FAIL: '+msg);}
     function sample(colors) {
         var ys=[];for(var i=0;i<colors.length;i++){var c=colors[i];ys.push(.2126*c[0]+.7152*c[1]+.0722*c[2]);}
         return SOCHNO.test.stats({rgb:colors,y:ys,w:colors.length,h:1});
+    }
+    // A full-resolution measurement as measure() returns it.
+    function metrics(o) {
+        var m={crush:.01,clip:.05,white:.01,chroma:.3,mean:.45,p01:.02,p50:.42,p99:.97,minP05:0,
+            lostShadows:0,lostColor:0,lostWhite:0,neutral:{c:.02,share:.05},skin:{c:0,share:0}};
+        for(var k in o)if(o.hasOwnProperty(k))m[k]=o[k];
+        return m;
+    }
+    function keysAreIds(settings) {
+        for(var k in settings)if(settings.hasOwnProperty(k)&&k.length!==4)return false;
+        return true;
     }
     try {
         eval(text);
@@ -27,44 +38,75 @@
             assert(SOCHNO.test.hue(primaries[i],1,0)===i*60,'hue '+i+' classified correctly');
             assert(six.bands[i].count===1,'each primary has its own color range');
         }
-        var gray=sample([[.1,.1,.1],[.4,.4,.4],[.7,.7,.7],[.95,.95,.95]]),g=SOCHNO.decide(gray,1280);
-        assert(g.vibrance===0&&g.saturation===0&&g.colorPresence===0,'neutral artwork stays neutral');
-        for(i=0;i<6;i++)assert(g.colorBands[i].saturation===0&&g.colorBands[i].lightness===0,'neutral palette unchanged');
-        var p=SOCHNO.decide(six,1280),tone=p.toneGuard,detail=p.detailGuard;
-        SOCHNO.test.reduce(p,{white:false,black:false,color:true,saturation:true,bands:[true,false,false,false,false,false]});
-        assert(p.colorGuard<1&&p.colorBands[0].guard<1,'color overflow is reduced');
-        assert(p.toneGuard===tone&&p.detailGuard===detail,'color overflow preserves light and detail');
-        assert(p.greenGuard===1,'a red-only overflow leaves the green layer alone');
-        var yellowFail=SOCHNO.decide(six,1280);
-        SOCHNO.test.reduce(yellowFail,{white:false,black:false,color:false,saturation:false,bands:[false,true,false,false,false,false]});
-        assert(yellowFail.greenGuard<1,'a yellow overflow weakens the green layer');
-        assert(p.colorBands[0].hue===0&&p.colorBands[1].hue===0,'reds and yellows are never pushed toward orange');
-        var color=p.colorGuard;
-        SOCHNO.test.reduce(p,{white:true,black:false,color:false,saturation:false,bands:[]});
-        assert(p.toneGuard<tone&&p.detailGuard<detail,'tonal overflow reduces tonal effects');
-        assert(p.colorGuard===color,'tonal overflow preserves color');
-        six.noise=0;var clean=SOCHNO.decide(six,1280);
-        six.noise=.025;var noisy=SOCHNO.decide(six,1280);
-        assert(noisy.sharp<clean.sharp&&noisy.texture<clean.texture&&noisy.noiseOpacity>0,'noise reduces sharpening');
+        var gray=sample([[.1,.1,.1],[.4,.4,.4],[.7,.7,.7],[.95,.95,.95]]),g=SOCHNO.decide(gray,metrics({chroma:0}),1280);
+        assert(g.color.vibrance===0&&g.color.saturation===0&&g.presence===0,'neutral artwork stays neutral');
+        for(i=0;i<6;i++)assert(g.color.bands[i]===0,'neutral palette unchanged');
+        assert(g.base.STSS===0&&g.base.HA_G===0&&g.base.LA_B===0,'no colour grading on monochrome');
+        var p=SOCHNO.decide(six,metrics({}),1280);
+        // Every Camera Raw key must be a four-character ID ("LNR " has a trailing space).
+        six.noise=.03;var noisy=SOCHNO.decide(six,metrics({}),1280);six.noise=0;
+        assert(keysAreIds(p.base)&&keysAreIds(p.detail)&&keysAreIds(noisy.detail),'Camera Raw keys are four-character IDs');
+        assert(noisy.detail['LNR ']>0,'noise enables Camera Raw luminance noise reduction');
+        assert(noisy.detail.Shrp<p.detail.Shrp&&noisy.detail.CrTx<p.detail.CrTx&&noisy.detail.ShpM>p.detail.ShpM,'noise reduces sharpening and texture, raises edge masking');
+        for(i=0;i<6;i++)assert(p.color.bands[i]>=0&&p.color.bands[i]<=20,'colour ranges are boosted or left alone, never desaturated');
+        assert(p.color.bands[0]<=10,'reds, which carry skin, stay gentle');
         var dull=sample([[.46,.38,.4],[.35,.4,.46],[.42,.46,.39]]);
-        assert(SOCHNO.decide(dull,1280).vibrance>clean.vibrance,'dull images get more global color');
-        var dark=sample([[.3,0,0],[.3,.3,0],[0,.3,0],[0,.3,.3],[0,0,.3],[.3,0,.3]]);
-        assert(SOCHNO.decide(dark,1280).lift===32,'rich color does not reduce exposure recovery on dark images');
-        // 1.3: dense neon artwork is not brightened or shadow-lifted like a dull photo of the same brightness.
-        var neon=SOCHNO.decide(sample([[.9,.1,.9],[.1,.2,.95],[.95,.75,.05],[.05,.05,.1],[.6,0,.8],[.1,.9,.9]]),1280);
-        var muted=SOCHNO.decide(sample([[.5,.35,.5],[.35,.4,.55],[.55,.5,.35],[.25,.25,.28],[.45,.3,.5],[.35,.5,.5]]),1280);
-        assert(neon.lift<5&&muted.lift>15,'neon keeps its dark density, a muted image of similar brightness is still lifted');
-        assert(neon.shadows<10,'neon shadows are not lifted into grey');
-        assert(neon.saturation>=10&&muted.saturation>neon.saturation,'saturation boost is strong, and stronger for muted colours');
-        for(var lift=-14;lift<=32;lift+=23)for(var guard=0;guard<=1;guard+=.5) {
-            var pts=SOCHNO.test.curvePoints({lift:lift,contrast:39,toneGuard:guard});
-            for(i=1;i<pts.length;i++)assert(pts[i][1]>pts[i-1][1]&&pts[i][1]<=255,'curve is monotonic and bounded');
-        }
-        assert(SOCHNO.test.quality(six,six).passed,'unchanged rendering passes');
-        var bad=sample(primaries);bad.white=six.white+.02;
-        assert(!SOCHNO.test.quality(six,bad).passed,'new white clipping fails');
-        var colorBad=sample(primaries);colorBad.colorClip=six.colorClip+.04;
-        assert(!SOCHNO.test.quality(six,colorBad).passed,'4% new colour clipping fails (1.2 limit is 3.5%)');
+        assert(SOCHNO.decide(dull,metrics({}),1280).color.vibrance>p.color.vibrance,'dull images get more global colour');
+        assert(SOCHNO.decide(dull,metrics({}),1280).colorCeiling>p.colorCeiling,'muted images may gain more chroma before the ceiling');
+        // Dense neon artwork is not brightened or shadow-lifted like a dull photo of the same brightness.
+        var neon=SOCHNO.decide(sample([[.9,.1,.9],[.1,.2,.95],[.95,.75,.05],[.05,.05,.1],[.6,0,.8],[.1,.9,.9]]),metrics({}),1280);
+        var muted=SOCHNO.decide(sample([[.5,.35,.5],[.35,.4,.55],[.55,.5,.35],[.25,.25,.28],[.45,.3,.5],[.35,.5,.5]]),metrics({}),1280);
+        assert(neon.base.Ex12===0&&muted.base.Ex12>neon.base.Ex12,'neon keeps its dark density, a muted image is still lifted');
+        // Same luminance as the neon sample, without colour: its shadows are lifted like a dull photo.
+        var greyNeon=SOCHNO.decide(sample([[.328,.328,.328],[.233,.233,.233],[.742,.742,.742],[.054,.054,.054],[.185,.185,.185],[.73,.73,.73]]),metrics({}),1280);
+        assert(neon.base.Sh12<10&&greyNeon.base.Sh12>2*neon.base.Sh12,'neon shadows are not lifted into grey');
+        var bright=SOCHNO.decide(sample([[.95,.9,.85],[.9,.92,.95],[.8,.85,.9],[.97,.97,.97]]),metrics({mean:.85,p99:1,white:.3,clip:.4}),1280);
+        assert(bright.base.Ex12>=0,'exposure never dims a bright thumbnail');
+        assert(bright.base.Hi12===0&&bright.base.Wh12===0,'clipped whites (text, UI) keep their full brightness');
+        var glow=SOCHNO.decide(sample([[.9,.88,.86],[.86,.87,.9],[.88,.9,.87],[.3,.3,.3]]),metrics({white:0,clip:0,p99:.93}),1280);
+        assert(glow.base.Hi12<0,'bright detail that is not clipped yet is recovered');
+        var flatMid=SOCHNO.decide(sample([[.4,.4,.42],[.45,.44,.43],[.5,.5,.49]]),metrics({p99:.6}),1280);
+        assert(flatMid.base.Wh12>0,'an image without a white point gets one');
+        assert(SOCHNO.decide(six,metrics({p01:.12}),1280).base.Bk12<0,'lifted blacks are deepened');
+        assert(SOCHNO.decide(six,metrics({crush:.12}),1280).base.Bk12>0,'crushed blacks are opened');
+        assert(SOCHNO.decide(six,metrics({minP05:.2}),1280).base.Dhze>SOCHNO.decide(six,metrics({}),1280).base.Dhze,'haze gets dehaze');
+        // Quality gate on full-resolution metrics.
+        var before=metrics({}),same=metrics({});
+        assert(SOCHNO.test.quality(before,same,p).passed,'unchanged rendering passes');
+        assert(!SOCHNO.test.quality(before,metrics({lostShadows:.007}),p).passed,'shadow detail crushed to black fails');
+        assert(!SOCHNO.test.quality(before,metrics({lostColor:.025}),p).passed,'2.5% of the frame newly clipped fails');
+        assert(SOCHNO.test.quality(before,metrics({lostColor:.015}),p).passed,'1.5% newly clipped is tolerated');
+        assert(!SOCHNO.test.quality(before,metrics({lostWhite:.007}),p).passed,'detail blown to white fails');
+        assert(SOCHNO.test.quality(before,metrics({clip:.2,white:.2}),p).passed,'near-white areas turning white are not a loss');
+        assert(!SOCHNO.test.quality(before,metrics({neutral:{c:.03,share:.05}}),p).passed,'tinted whites fail');
+        assert(SOCHNO.test.quality(before,metrics({neutral:{c:.012,share:.05}}),p).passed,'cleaner whites pass');
+        var withSkin=metrics({skin:{c:.3,share:.04}});
+        assert(!SOCHNO.test.quality(withSkin,metrics({skin:{c:.36,share:.04}}),p).passed,'oversaturated skin fails');
+        assert(SOCHNO.test.quality(before,metrics({skin:{c:.5,share:0}}),p).passed,'no faces, no skin check');
+        assert(!SOCHNO.test.quality(before,metrics({mean:.40}),p).passed,'a darker result fails');
+        var high=SOCHNO.test.quality(before,metrics({chroma:.3*(1+p.colorCeiling+.05)}),p);
+        assert(high.passed&&high.colorHigh,'too much colour is retuned but is not a hard failure');
+        // Guards act on their own cause only.
+        var r=SOCHNO.decide(six,metrics({}),1280),tone=SOCHNO.test.copy(r);
+        SOCHNO.test.reduce(r,{crush:true});
+        assert(r.base.Bk12>tone.base.Bk12&&r.base.Sh12>tone.base.Sh12&&r.base.Cr12<tone.base.Cr12,'crush opens shadows and lowers contrast');
+        assert(r.colorScale===tone.colorScale,'crush leaves colour alone');
+        var c=SOCHNO.decide(six,metrics({}),1280);SOCHNO.test.reduce(c,{colorHigh:true,gain:c.colorCeiling*1.5});
+        assert(c.colorScale<1&&c.base.Cr12===tone.base.Cr12&&c.detail.CrTx===tone.detail.CrTx,'too much colour lowers colour only');
+        var cl=SOCHNO.decide(six,metrics({}),1280),again=SOCHNO.test.reduce(cl,{clip:true});
+        assert(cl.colorScale<1&&cl.base.Hi12===tone.base.Hi12&&!again,'first new clipping lowers colour only, without another Camera Raw pass');
+        again=SOCHNO.test.reduce(cl,{clip:true});
+        assert(again&&cl.base.Hi12<tone.base.Hi12&&cl.base.Cr12<tone.base.Cr12,'persistent clipping lowers contrast and recovers highlights');
+        var wh=SOCHNO.decide(six,metrics({}),1280);
+        assert(SOCHNO.test.reduce(wh,{white:true})&&wh.base.Cr12<tone.base.Cr12&&wh.colorScale===1,'new white clipping is a tone problem, not a colour one');
+        var nt=SOCHNO.decide(six,metrics({}),1280);
+        assert(!SOCHNO.test.reduce(nt,{neutral:true}),'cleaning whites harder needs no Camera Raw pass');
+        var n=SOCHNO.decide(six,metrics({}),1280),n0=n.neutral;SOCHNO.test.reduce(n,{neutral:true});
+        assert(n.neutral<n0&&n.neutral>=-90,'tinted whites are cleaned harder, within limits');
+        for(i=0;i<5;i++)SOCHNO.test.reduce(c,{colorHigh:true,gain:1});
+        assert(c.colorScale>=.2,'colour never drops below a floor through repeated retunes');
+        var cp=SOCHNO.test.copy(r);cp.base.Bk12=99;
+        assert(r.base.Bk12!==99,'parameter snapshots do not share settings');
         if(node)console.log('PASS '+assertions+' policy assertions');
         else $.writeln('PASS '+assertions+' policy assertions');
         return 'PASS '+assertions+' policy assertions';
