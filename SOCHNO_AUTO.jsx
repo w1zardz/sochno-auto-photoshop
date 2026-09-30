@@ -183,17 +183,18 @@ var SOCHNO = (function () {
         return {x0:x0/w,y0:best.y0/h,x1:(x1+1)/w,y1:(best.y1+1)/h,share:best.count/n,backdrop:bg.length?bg[Math.floor(bg.length/2)]:0};
     }
     // ---- Full-resolution maps. Photoshop computes them natively; the script only reads histograms.
-    function chRef(name) {
+    function chRef(name,docName) {
         var r=new ActionReference(),e={RGB:'RGB ',R:'Rd  ',G:'Grn ',B:'Bl  ',MASK:'Msk '}[name];
         if(e)r.putEnumerated(C('Chnl'),C('Chnl'),C(e)); else r.putName(C('Chnl'),TAG+name);
+        if(docName)r.putName(C('Dcmn'),docName);
         return r;
     }
     function selectChannel(name) {
         var d=new ActionDescriptor();d.putReference(C('null'),chRef(name));d.putBoolean(C('MkVs'),false);
         executeAction(C('slct'),d,DialogModes.NO);
     }
-    function applyImage(src,mode,scale,opacity) {
-        var d=new ActionDescriptor(),s=new ActionDescriptor();s.putReference(C('T   '),chRef(src));
+    function applyImage(src,mode,scale,opacity,docName) {
+        var d=new ActionDescriptor(),s=new ActionDescriptor();s.putReference(C('T   '),chRef(src,docName));
         s.putEnumerated(C('Clcl'),C('Clcn'),C(mode));if(scale){s.putDouble(C('Scl '),scale);s.putInteger(C('Ofst'),0);}
         if(opacity)s.putUnitDouble(C('Opct'),C('#Prc'),opacity);
         d.putObject(C('With'),C('Clcl'),s);executeAction(C('AppI'),d,DialogModes.NO);
@@ -230,6 +231,15 @@ var SOCHNO = (function () {
         for(var i=0;i<points.length;i++){var pt=new ActionDescriptor();pt.putDouble(C('Hrzn'),points[i][0]);pt.putDouble(C('Vrtc'),points[i][1]);pl.putObject(C('Pnt '),pt);}
         ch.putList(C('Crv '),pl);list.putObject(C('CrvA'),ch);d.putList(C('Adjs'),list);
         executeAction(C('Crvs'),d,DialogModes.NO);
+    }
+    // Levels input range on the targeted channel: values <= black become 0, values >= white become 255.
+    function levels(black,white) {
+        var d=new ActionDescriptor(),list=new ActionList(),ch=new ActionDescriptor(),r=new ActionReference(),input=new ActionList();
+        d.putEnumerated(S('presetKind'),S('presetKindType'),S('presetKindCustom'));
+        r.putEnumerated(C('Chnl'),C('Ordn'),C('Trgt'));ch.putReference(C('Chnl'),r);
+        input.putInteger(black);input.putInteger(white);ch.putList(C('Inpt'),input);
+        list.putObject(C('LvlA'),ch);d.putList(C('Adjs'),list);
+        executeAction(C('Lvls'),d,DialogModes.NO);
     }
     function filter(id,radius) {var d=new ActionDescriptor();d.putUnitDouble(C('Rds '),C('#Pxl'),radius);executeAction(C(id),d,DialogModes.NO);}
     function histogram(doc,name) {var c=doc.channels.getByName(TAG+name),v=c.visible;c.visible=true;var h=c.histogram;c.visible=v;return h;}
@@ -293,30 +303,36 @@ var SOCHNO = (function () {
             removeChannels(['TBR','TDK']);
             if(s.titleMask<.005){removeChannels(['HALO']);s.title=null;}
         }
-        // ROOM masks: where the source still had room before black or white. The gate counts only detail
-        // a render really loses there; near-white paper turning white is not a loss.
-        channel(doc,'RHI','MAX');curve([[0,255],[234,255],[242,0],[255,0]]);
-        channel(doc,'RWH','MIN');curve([[0,255],[234,255],[242,0],[255,0]]);
-        channel(doc,'RLO','MAX');curve([[0,0],[8,0],[16,255],[255,255]]);
+        // ROOM masks (RHI, RWH, RLO) are built by the first measure(), in the same sRGB as every measurement.
         removeChannels(['TMP','MAX','MIN','CHR','LUM']);
         activeRGB(doc);
     }
-    // Share of the whole frame inside a source mask whose channel value falls in [lo,hi].
+    // Region metrics by channel arithmetic (mask × thresholded channel), without loading selections.
+    function hasChannel(t,name) {try{t.channels.getByName(TAG+name);return true;}catch(e){return false;}}
+    // Share of the whole frame inside a source mask whose channel value falls in [lo,hi] (lo=0 or hi=255).
     function regionFrac(t,mask,name,lo,hi) {
-        var c=null;try{c=t.channels.getByName(TAG+mask);}catch(e){return 0;}
-        t.selection.load(c,SelectionType.REPLACE,false);
-        var h=histogram(t,name),s=0;t.selection.deselect();
-        for(var i=lo;i<=hi;i++)s+=h[i];
-        return s/(t.width.as('px')*t.height.as('px'));
+        if(!hasChannel(t,mask))return 0;
+        channel(t,'QRY',name);
+        // Levels is linear, so the threshold is exact; a steep Curves spline overshoots between its points.
+        if(lo===0){levels(hi,hi+1);executeAction(C('Invr'),undefined,DialogModes.NO);} else levels(lo-1,lo);
+        applyImage(mask,'Mltp');
+        var h=histogram(t,'QRY'),s=0;removeChannels(['QRY']);
+        for(var i=128;i<256;i++)s+=h[i];
+        return s/total(h);
     }
+    // Mean chroma weighted by a source mask, and the mask's share of the frame.
     function regionChroma(t,name) {
-        var c=null;try{c=t.channels.getByName(TAG+name);}catch(e){return {c:0,share:0};}
-        t.selection.load(c,SelectionType.REPLACE,false);
-        var h=histogram(t,'MCHR'),n=total(h);t.selection.deselect();
-        return {c:mean(h),share:n/(t.width.as('px')*t.height.as('px'))};
+        if(!hasChannel(t,name))return {c:0,share:0};
+        channel(t,'QRY','MCHR');applyImage(name,'Mltp');
+        var weighted=mean(histogram(t,'QRY')),share=mean(histogram(t,name));removeChannels(['QRY']);
+        return {c:share>.0005?weighted/share:0,share:share};
     }
     // Exact full-resolution metrics of the visible result, in sRGB like the YouTube export.
-    function measure(doc) {
+    // withRoom (the source measurement): also build the ROOM masks — where the source still had room before
+    // black or white — and copy them into doc. They must come from the same sRGB conversion as the
+    // measurements: masks built in a Display P3 document marked a saturated red car as "room", its
+    // conversion to sRGB clipped, and the gate blamed the render and dimmed it to 20%.
+    function measure(doc,withRoom) {
         var t=null,m={};
         try {
             t=doc.duplicate('SOCHNO measure',true);activeRGB(t);t.selection.deselect();t.flatten();
@@ -325,6 +341,15 @@ var SOCHNO = (function () {
             var hl=t.histogram,n=total(hl);
             channel(t,'MMAX','R');applyImage('G','Lghn');applyImage('B','Lghn');
             channel(t,'MMIN','R');applyImage('G','Drkn');applyImage('B','Drkn');
+            if(withRoom) {
+                var room=['RHI','RWH','RLO'];
+                channel(t,'RHI','MMAX');curve([[0,255],[234,255],[242,0],[255,0]]);
+                channel(t,'RWH','MMIN');curve([[0,255],[234,255],[242,0],[255,0]]);
+                channel(t,'RLO','MMAX');curve([[0,0],[8,0],[16,255],[255,255]]);
+                app.activeDocument=doc;removeChannels(room);
+                for(var ri=0;ri<room.length;ri++){channel(doc,room[ri]);applyImage(room[ri],'Nrml',0,0,t.name);}
+                activeRGB(doc);app.activeDocument=t;
+            }
             channel(t,'MCHR','MMAX');applyImage('MMIN','Sbtr',1);
             var hx=histogram(t,'MMAX'),hn=histogram(t,'MMIN'),hc=histogram(t,'MCHR');
             m.crush=frac(hx,0,4);m.clip=frac(hx,254,255);m.white=frac(hn,251,255);m.chroma=mean(hc);
@@ -542,7 +567,7 @@ var SOCHNO = (function () {
             s.noise=(q(hist,n,.75)-q(hist,n,.25))/2;
         } finally {close(noiseDoc);app.activeDocument=work;}
         lap('noise');buildMasks(work,s);lap('masks');
-        var before=measure(work);lap('measure0');
+        var before=measure(work,true);lap('measure0');
         var p=decide(s,before,work.width.as('px')),r=null,after=null,flags=null,lastPassed=null,full=true;
         var passes=PASSES;
         // Measure the real render; tone or detail problems re-run Camera Raw, colour-only ones just retune colour.
@@ -628,7 +653,7 @@ var SOCHNO = (function () {
     };
     api.analyze=function(doc){return stats(pixels(doc,128));};
     api.decide=decide;
-    api.version='2.1.0';
+    api.version='2.1.1';
     return api;
 })();
 if(!$.global.SOCHNO_NO_AUTORUN) {
