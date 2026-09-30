@@ -12,7 +12,7 @@
     var charIDToTypeID=function(v){return v;},stringIDToTypeID=function(v){return v;};
     // Expose pure functions only in the test copy; production API stays small.
     text=text.replace(new RegExp('^'+String.fromCharCode(0xFEFF)+'?#target[^'+String.fromCharCode(10)+']*','m'),'').replace('api.decide=decide;',
-        'api.decide=decide;api.test={stats:stats,hue:hue,quality:quality,reduce:reduce,merged:merged,copy:copy};');
+        'api.decide=decide;api.test={stats:stats,hue:hue,quality:quality,reduce:reduce,merged:merged,copy:copy,titleBox:titleBox};');
     var assertions=0;
     function assert(ok,msg){assertions++;if(!ok)throw Error('FAIL: '+msg);}
     function sample(colors) {
@@ -105,6 +105,37 @@
         assert(n.neutral<n0&&n.neutral>=-90,'tinted whites are cleaned harder, within limits');
         for(i=0;i<5;i++)SOCHNO.test.reduce(c,{colorHigh:true,gain:1});
         assert(c.colorScale>=.2,'colour never drops below a floor through repeated retunes');
+        // Foliage: grass and leaves get less Vibrance and gentler yellow/green ranges; reds are unaffected.
+        var leaves=sample([[.55,.55,.2],[.45,.55,.2],[.35,.5,.15],[.6,.58,.25],[.9,.1,.1],[.2,.4,.9]]);
+        var clean=sample([[.3,.3,.33],[.33,.3,.3],[.32,.34,.32],[.4,.4,.42],[.9,.1,.1],[.2,.4,.9]]);
+        assert(leaves.foliage>.5&&clean.foliage===0,'grass tones are recognised as foliage, greys are not');
+        var lp=SOCHNO.decide(leaves,metrics({}),1280);leaves.foliage=0;var lp0=SOCHNO.decide(leaves,metrics({}),1280);
+        assert(lp.color.vibrance<lp0.color.vibrance,'foliage-heavy frames get less Vibrance');
+        assert(lp.color.bands[1]<=6&&lp.color.bands[2]<=6,'yellow and green ranges stay gentle on foliage');
+        assert(lp.color.bands[0]===lp0.color.bands[0]&&lp.color.bands[4]===lp0.color.bands[4],'reds and blues keep their boost');
+        // Title: bright letters with a dark outline are found; clouds without an outline are not.
+        function frame(w,h,bg,paint) {
+            var rgb=[],ys=[];
+            for(var y=0;y<h;y++)for(var x=0;x<w;x++){var c=paint(x,y)||bg;rgb.push(c);ys.push(.2126*c[0]+.7152*c[1]+.0722*c[2]);}
+            return {rgb:rgb,y:ys,w:w,h:h};
+        }
+        var grass=[.55,.55,.25],yellow=[1,.85,0],ink=[.02,.02,.02];
+        var titled=frame(64,36,grass,function(x,y){
+            if(y>=26&&y<=33&&x>=8&&x<=40)return (y===26||y===33||x===8||x===40||x%6===0)?ink:yellow;
+        });
+        var tb=SOCHNO.test.titleBox(titled);
+        assert(tb&&tb.y0>.65&&tb.y1<=1&&tb.x0<.2&&tb.x1<.7,'title band found at the bottom');
+        assert(tb.backdrop>.4,'bright grass backdrop measured behind the title');
+        var cloudy=frame(64,36,[.35,.55,.85],function(x,y){if(y>=4&&y<=12&&x>=10&&x<=30)return [.95,.95,.97];});
+        assert(SOCHNO.test.titleBox(cloudy)===null,'clouds are not a title');
+        var ts=sample([[.5,.5,.3]]);ts.title=tb;
+        var tp=SOCHNO.decide(ts,metrics({}),1280);
+        assert(tp.title&&tp.title.dim>=.12&&tp.title.dim<=.27,'bright backdrop behind the title is dimmed within limits');
+        ts.title={x0:0,y0:.7,x1:.5,y1:1,share:.02,backdrop:.15};
+        assert(SOCHNO.decide(ts,metrics({}),1280).title===null,'a dark backdrop is left alone');
+        assert(SOCHNO.decide(six,metrics({}),1280).title===null,'no title, no title layer');
+        var tcp=SOCHNO.test.copy(tp);tcp.title.dim=.9;
+        assert(tp.title.dim!==.9,'title settings are copied with snapshots');
         var cp=SOCHNO.test.copy(r);cp.base.Bk12=99;
         assert(r.base.Bk12!==99,'parameter snapshots do not share settings');
         if(node)console.log('PASS '+assertions+' policy assertions');

@@ -1,5 +1,5 @@
 ﻿#target photoshop
-/* SOCHNO AUTO 2.0 | Adaptive color grading and thumbnail finishing for Photoshop.
+/* SOCHNO AUTO 2.1 | Adaptive color grading and thumbnail finishing for Photoshop.
    Per-image analysis drives Camera Raw; full-resolution masks keep each effect where it helps;
    a quality gate measures the real Photoshop render and retunes it.
    Local, self-contained ExtendScript. RGB 8/16-bit. No network or paid plugins.
@@ -90,7 +90,7 @@ var SOCHNO = (function () {
     }
     function stats(px) {
         var n=px.rgb.length,h=[],sum=0,sat=0,hot=0,white=0,black=0,colorClip=0,shadow=0,light=0,edge=0,ec=0,res=[],resCount=0;
-        var bands=[],neutral=[0,0,0],neutralN=0,chroma=0,colorful=0,skin=0,flat=0,interior=0;
+        var bands=[],neutral=[0,0,0],neutralN=0,chroma=0,colorful=0,skin=0,flat=0,interior=0,foliage=0;
         for(var bi=0;bi<6;bi++)bands.push({count:0,saturation:0,hot:0,clip:0});
         for(var i=0;i<256;i++)h[i]=0;
         for(i=0;i<n;i++) {
@@ -105,6 +105,9 @@ var SOCHNO = (function () {
                 if(s>.25)colorful++;
                 // Skin-like: warm hue, moderate saturation, mid lightness. Gold is usually more saturated.
                 if(hh>=8&&hh<=45&&s>.18&&s<.6&&y>.25&&y<.85)skin++;
+                // Grass and leaves: yellow-green of moderate saturation. Vibrance lifts exactly these
+                // mid-saturated tones most and turns them acid; saturated yellow titles are not counted.
+                if(hh>=45&&hh<=150&&s<.72&&y>.12&&y<.8)foliage++;
             }
             // Conservative neutral candidates only; colored scenery is not a white reference.
             if(s<.16&&y>.25&&y<.85) {
@@ -137,7 +140,47 @@ var SOCHNO = (function () {
         return {mean:sum/n,median:q(h,n,.5),p05:q(h,n,.05),p10:q(h,n,.1),p90:q(h,n,.9),p95:q(h,n,.95),
             saturation:sat/n,hot:hot/n,white:white/n,black:black/n,colorClip:colorClip/n,shadows:shadow/n,highlights:light/n,
             edge:ec?edge/ec:0,flat:interior?flat/interior:0,noise:res.length>50?res[Math.floor(res.length*.65)]:0,noiseSamples:res.length,
-            bands:bands,neutral:neutral,neutralShare:neutralN/n,chroma:chroma/n,colorful:colorful/n,skin:skin/n};
+            bands:bands,neutral:neutral,neutralShare:neutralN/n,chroma:chroma/n,colorful:colorful/n,skin:skin/n,foliage:foliage/n,
+            title:titleBox(px)};
+    }
+    // The main title: bright white or saturated letters with a dark outline or shadow right next to them.
+    // Clouds and glare are bright too, but have no dark edge. Rows are grouped into bands; the band with
+    // the most letter pixels is the title. Returns its box (fractions of the frame) and backdrop brightness.
+    function titleBox(px) {
+        var w=px.w,h=px.h,n=w*h,rows=[],pts=[],x,y,i;
+        for(y=0;y<h;y++)rows[y]=0;
+        for(i=0;i<n;i++) {
+            var c=px.rgb[i],l=px.y[i],mx=Math.max(c[0],c[1],c[2]),mn=Math.min(c[0],c[1],c[2]);
+            if(l<=.72||!(mn>.85||(mx-mn)/mx>.5))continue;
+            x=i%w;y=Math.floor(i/w);
+            var edge=false;
+            for(var dy=-2;dy<=2&&!edge;dy++)for(var dx=-2;dx<=2;dx++) {
+                var xx=x+dx,yy=y+dy;
+                if(xx>=0&&yy>=0&&xx<w&&yy<h&&px.y[yy*w+xx]<l-.5){edge=true;break;}
+            }
+            if(edge){rows[y]++;pts.push([x,y]);}
+        }
+        // Bands of rows with letters; gaps up to two rows are line spacing.
+        var best=null,cur=null,gap=0;
+        for(y=0;y<=h;y++) {
+            if(y<h&&rows[y]>0){if(!cur)cur={y0:y,y1:y,count:0};cur.y1=y;cur.count+=rows[y];gap=0;}
+            else if(cur&&(y===h||++gap>2)){if(!best||cur.count>best.count)best=cur;cur=null;gap=0;}
+        }
+        if(!best||best.count<n*.004)return null;
+        var xs=[];for(i=0;i<pts.length;i++)if(pts[i][1]>=best.y0&&pts[i][1]<=best.y1)xs.push(pts[i][0]);
+        xs.sort(function(a,b){return a-b;});
+        var x0=xs[Math.floor(xs.length*.03)],x1=xs[Math.min(xs.length-1,Math.floor(xs.length*.97))];
+        // Backdrop: median of a ring around the title box. Inside the box outlines and shadows of the
+        // letters dominate; the ring is the ground the title actually has to stand out from.
+        var mx0=Math.max(2,round(w*.05)),my0=Math.max(2,round(h*.06));
+        var bx0=Math.max(0,x0-mx0),bx1=Math.min(w-1,x1+mx0),by0=Math.max(0,best.y0-my0),by1=Math.min(h-1,best.y1+my0);
+        var bg=[];
+        for(y=by0;y<=by1;y++)for(x=bx0;x<=bx1;x++) {
+            if(x>=x0&&x<=x1&&y>=best.y0&&y<=best.y1)continue;
+            var v=px.y[y*w+x];if(v<=.72)bg.push(v);
+        }
+        bg.sort(function(a,b){return a-b;});
+        return {x0:x0/w,y0:best.y0/h,x1:(x1+1)/w,y1:(best.y1+1)/h,share:best.count/n,backdrop:bg.length?bg[Math.floor(bg.length/2)]:0};
     }
     // ---- Full-resolution maps. Photoshop computes them natively; the script only reads histograms.
     function chRef(name) {
@@ -225,6 +268,31 @@ var SOCHNO = (function () {
         channel(doc,'COL','CHR');curve([[0,0],[14,0],[42,255],[255,255]]);
         if(s.faces)applyImage('SKIN','Sbtr',1);
         filter('GsnB',Math.max(.5,1.5*sc));
+        // FOL: grass and leaves — green above blue, moderate colour, not bright. Colour layers act there at
+        // reduced strength, so foliage stays green instead of acid. Saturated or bright yellow (titles, gold)
+        // is outside the mask and keeps full colour, as do reds and skies.
+        channel(doc,'FOL','G');applyImage('B','Sbtr',1);curve([[0,0],[18,0],[60,255],[255,255]]);
+        channel(doc,'FCH','CHR');curve([[0,255],[120,255],[190,0],[255,0]]);
+        channel(doc,'FLU','LUM');curve([[0,255],[185,255],[215,0],[255,0]]);
+        selectChannel('FOL');applyImage('FCH','Mltp');applyImage('FLU','Mltp');filter('GsnB',Math.max(.5,2*sc));
+        s.foliageMask=mean(histogram(doc,'FOL'));
+        selectChannel('COL');applyImage('FOL','Sbtr',1,55);
+        removeChannels(['FOL','FCH','FLU']);
+        // HALO: soft backdrop around the title letters. Letters are bright pixels with a dark outline within a
+        // few pixels, kept only inside the title band that the analysis found; the halo is their dilated blur.
+        if(s.title) {
+            var W=doc.width.as('px'),H=doc.height.as('px'),t=s.title;
+            channel(doc,'TBR','LUM');curve([[0,0],[175,0],[200,255],[255,255]]);
+            channel(doc,'TDK','LUM');filter('Mnm ',Math.max(1,3*sc));curve([[0,255],[60,255],[100,0],[255,0]]);
+            selectChannel('TBR');applyImage('TDK','Mltp');
+            var x0=Math.max(0,round((t.x0-.02)*W)),x1=Math.min(W,round((t.x1+.02)*W)),y0=Math.max(0,round((t.y0-.03)*H)),y1=Math.min(H,round((t.y1+.03)*H));
+            var black=new SolidColor();black.rgb.red=black.rgb.green=black.rgb.blue=0;
+            doc.selection.select([[x0,y0],[x1,y0],[x1,y1],[x0,y1]]);doc.selection.invert();doc.selection.fill(black);doc.selection.deselect();
+            channel(doc,'HALO','TBR');filter('Mxm ',Math.max(1,10*sc));filter('GsnB',Math.max(1,14*sc));curve([[0,0],[100,255],[255,255]]);
+            s.titleMask=mean(histogram(doc,'HALO'));
+            removeChannels(['TBR','TDK']);
+            if(s.titleMask<.005){removeChannels(['HALO']);s.title=null;}
+        }
         // ROOM masks: where the source still had room before black or white. The gate counts only detail
         // a render really loses there; near-white paper turning white is not a loss.
         channel(doc,'RHI','MAX');curve([[0,255],[234,255],[242,0],[255,0]]);
@@ -299,13 +367,20 @@ var SOCHNO = (function () {
         detail.ShpR=Math.round(clamp(.75+.2*width/1280,.6,2)*10)/10;detail.ShpD=20;detail.ShpM=round(35+35*noisy);
         if(noisy>.3)detail['LNR ']=round(10+30*noisy);
         // Dull colour ranges get more, saturated or clipping ones less (never negative). Reds carry skin.
+        // Lots of grass and leaves: less global Vibrance and gentler yellow and green ranges, so foliage does
+        // not turn acid and compete with yellow titles. The FOL mask weakens colour on foliage itself as well.
+        var leafy=ramp(s.foliage||0,.08,.3);
         for(var i=0;i<6;i++) {
             var b=s.bands[i],boost=6+18*ramp(.88-b.saturation,0,.6)-25*b.hot-15*b.clip;
             if(i===0)boost=Math.min(boost,12);
+            if(i===1||i===2)boost=Math.min(boost,14-8*leafy);
             bands.push(round(clamp(boost,0,24)*presence));
         }
-        return {base:base,detail:detail,
-            color:{vibrance:round((30+20*(1-vivid))*presence),saturation:round(clamp(6+10*(1-vivid)-6*s.hot,0,14)*presence),bands:bands},
+        // Title backdrop: the brighter the ground behind the letters, the more it is dimmed (up to about -0.45 EV).
+        // A dark backdrop already separates the title and is left alone.
+        var title=s.title&&s.title.backdrop>.3?{dim:Math.round((.12+.15*ramp(s.title.backdrop,.35,.65))*100)/100}:null;
+        return {base:base,detail:detail,title:title,
+            color:{vibrance:round((30+20*(1-vivid))*presence*(1-.35*leafy)),saturation:round(clamp(6+10*(1-vivid)-6*s.hot,0,14)*presence*(1-.3*leafy)),bands:bands},
             neutral:-round((40+25*ramp(m.neutral.c,.01,.04))*ramp(m.neutral.share,.002,.02)),
             // Upper bound for the measured chroma gain; muted images may gain more before looking painted.
             colorCeiling:.18+.25*(1-vivid)*(.5+.5*colorful),colorScale:1,presence:presence,passes:0,clipTries:0,guards:[],log:[]};
@@ -340,13 +415,14 @@ var SOCHNO = (function () {
         }
         selectChannel('MASK');applyImage(name,'Nrml');selectChannel('RGB');
     }
-    // Blend If on the active layer, "This layer" sliders: black split and white split.
-    function blendIfThisLayer(b0,b1,w0,w1) {
+    // Blend If on the active layer: "This layer" sliders (b0..w1) and "Underlying layer" sliders (u, optional).
+    function blendIf(b0,b1,w0,w1,u) {
+        u=u||[0,0,255,255];
         var d=new ActionDescriptor(),r=new ActionReference(),layer=new ActionDescriptor(),list=new ActionList(),range=new ActionDescriptor(),ch=new ActionReference();
         r.putEnumerated(C('Lyr '),C('Ordn'),C('Trgt'));d.putReference(C('null'),r);
         ch.putEnumerated(C('Chnl'),C('Chnl'),C('Gry '));range.putReference(C('Chnl'),ch);
         range.putInteger(C('SrcB'),b0);range.putInteger(C('Srcl'),b1);range.putInteger(C('SrcW'),w0);range.putInteger(C('Srcm'),w1);
-        range.putInteger(C('DstB'),0);range.putInteger(C('Dstl'),0);range.putInteger(C('DstW'),255);range.putInteger(C('Dstt'),255);
+        range.putInteger(C('DstB'),u[0]);range.putInteger(C('Dstl'),u[1]);range.putInteger(C('DstW'),u[2]);range.putInteger(C('Dstt'),u[3]);
         list.putObject(C('Blnd'),range);layer.putList(C('Blnd'),list);d.putObject(C('T   '),C('Lyr '),layer);
         executeAction(C('setd'),d,DialogModes.NO);
     }
@@ -392,9 +468,24 @@ var SOCHNO = (function () {
         doc.activeLayer=detail;detail.name='02 | ОБЪЁМ + ТЕКСТУРА + РЕЗКОСТЬ · В ФОКУСЕ';
         acr(merged(p.base,p.detail));detail.blendMode=BlendMode.LUMINOSITY;
         // Detail fades out in deep shadows and near white, where it would crush or clip.
-        blendIfThisLayer(0,12,225,250);maskFrom('DET',false);
-        var detailId=detail.id;
-        return {group:group,detailId:detailId,color:colorLayers(doc,p,detailId)};
+        blendIf(0,12,225,250);maskFrom('DET',false);
+        var detailId=detail.id,color=colorLayers(doc,p,detailId);
+        if(p.title)titleLayer(doc,p,color.length?color[color.length-1]:detailId);
+        return {group:group,detailId:detailId,color:color};
+    }
+    // 06: dims the ground around the title so the letters stand out. Luminosity mode keeps the hue;
+    // Blend If on the underlying layer leaves bright letters untouched, the HALO mask keeps it near the title.
+    function titleLayer(doc,p,belowId) {
+        selectLayerId(doc,belowId);
+        var d=new ActionDescriptor(),list=new ActionList(),ch=new ActionDescriptor(),r=new ActionReference(),pl=new ActionList();
+        d.putEnumerated(S('presetKind'),S('presetKindType'),S('presetKindCustom'));
+        r.putEnumerated(C('Chnl'),C('Chnl'),C('Cmps'));ch.putReference(C('Chnl'),r);
+        var pts=[[0,0],[255,round(255*(1-p.title.dim))]];
+        for(var i=0;i<pts.length;i++){var pt=new ActionDescriptor();pt.putDouble(C('Hrzn'),pts[i][0]);pt.putDouble(C('Vrtc'),pts[i][1]);pl.putObject(C('Pnt '),pt);}
+        ch.putList(C('Crv '),pl);list.putObject(C('CrvA'),ch);d.putList(C('Adjs'),list);
+        var l=adjustment('06 | ПОДЛОЖКА ПОД ЗАГОЛОВКОМ · −'+round(p.title.dim*100)+'%',C('Crvs'),d);
+        l.blendMode=BlendMode.LUMINOSITY;blendIf(0,0,255,255,[0,0,175,215]);maskFrom('HALO',true);
+        return l.id;
     }
     function recolor(doc,r,p) {
         for(var i=r.color.length-1;i>=0;i--)deleteLayerId(r.color[i]);
@@ -481,7 +572,7 @@ var SOCHNO = (function () {
             opacity=Math.max(0,opacity-20);r.group.opacity=opacity;
             after=measure(work);flags=quality(before,after,p);
         }
-        r.group.name=PREFIX+' 2.0 | ЦВЕТ + ОБЪЁМ · '+opacity+'%';
+        r.group.name=PREFIX+' 2.1 | ЦВЕТ + ОБЪЁМ · '+opacity+'%';
         return {group:r.group,before:before,after:after,stats:s,parameters:p,flags:flags,guardPassed:flags.passed,outputOpacity:opacity,
             ms:new Date().getTime()-started,timing:timing.join(' ')};
     }
@@ -537,7 +628,7 @@ var SOCHNO = (function () {
     };
     api.analyze=function(doc){return stats(pixels(doc,128));};
     api.decide=decide;
-    api.version='2.0.0';
+    api.version='2.1.0';
     return api;
 })();
 if(!$.global.SOCHNO_NO_AUTORUN) {
